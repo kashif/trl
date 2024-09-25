@@ -22,8 +22,15 @@ class SCoREConfig(OnlineDPOConfig):
     r"""
     Configuration class for the [`SCoRETrainer`].
 
-    Subclass of [`OnlineDPOConfig`] we can use all its arguments and add the following:
+    Subclass of [`OnlineDPOConfig`] we can use all its arguments and add the following prompts:
 
+    Parameters:
+        correction_instruction (`str`, *optional*, defaults to `"The previous response may contain errors. Please review and correct any mistakes: "`):
+            Instruction for self-correction in the second attempt.
+        first_attempt_prefix (`str`, *optional*, defaults to `"First attempt: "`):
+            Prefix for the first attempt in the second attempt prompt.
+        second_attempt_prefix (`str`, *optional*, defaults to `"Improved response: "`):
+            Prefix for the second attempt in the model output.
     """
 
     # Prompts
@@ -46,7 +53,6 @@ class SCoREConfig(OnlineDPOConfig):
         # Ensure that the correction instruction ends with a space
         if not self.correction_instruction.endswith(" "):
             self.correction_instruction += " "
-
         # Ensure that the prefixes end with a space
         if not self.first_attempt_prefix.endswith(" "):
             self.first_attempt_prefix += " "
