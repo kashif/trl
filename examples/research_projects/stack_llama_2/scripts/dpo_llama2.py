@@ -21,7 +21,7 @@ import torch
 from accelerate import Accelerator
 from datasets import Dataset, load_dataset
 from peft import LoraConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, set_seed
+from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, set_seed, BitsAndBytesConfig
 
 from trl import DPOConfig, DPOTrainer
 
@@ -38,8 +38,8 @@ class ScriptArguments:
 
     # training parameters
     model_name_or_path: Optional[str] = field(
-        default="../sft/results/final_checkpoint",
-        metadata={"help": "the location of the SFT model name or path"},
+        default="results/final_checkpoint",
+        metadata={"help": "the location of the DPO model name or path"},
     )
     learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "optimizer learning rate"})
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "the lr scheduler type"})
@@ -117,7 +117,7 @@ def get_stack_exchange_paired(
     Prompts are structured as follows:
       "Question: " + <prompt> + "\n\nAnswer: "
     """
-    dataset = load_dataset(
+    c = load_dataset(
         "lvwerra/stack-exchange-paired",
         split="train",
         cache_dir=cache_dir,
@@ -158,8 +158,7 @@ if __name__ == "__main__":
         script_args.model_name_or_path,
         low_cpu_mem_usage=True,
         torch_dtype=torch_dtype,
-        load_in_4bit=script_args.load_in_4bit,
-        device_map={"": Accelerator().local_process_index},
+        quantization_config=BitsAndBytesConfig(load_in_4bit=True) if script_args.load_in_4bit else None,
     )
     model.config.use_cache = False
 
@@ -190,6 +189,9 @@ if __name__ == "__main__":
 
     # 4. initialize training arguments:
     training_args = DPOConfig(
+        beta=script_args.beta,
+        max_prompt_length=script_args.max_prompt_length,
+        max_length=script_args.max_length,
         per_device_train_batch_size=script_args.per_device_train_batch_size,
         per_device_eval_batch_size=script_args.per_device_eval_batch_size,
         max_steps=script_args.max_steps,
@@ -205,7 +207,8 @@ if __name__ == "__main__":
         lr_scheduler_type=script_args.lr_scheduler_type,
         warmup_steps=script_args.warmup_steps,
         optim=script_args.optimizer_type,
-        bf16=True,
+        bf16=True if script_args.model_dtype == "bfloat16" else False,
+        fp16=True if script_args.model_dtype == "float16" else False,
         remove_unused_columns=False,
         run_name="dpo_llama2",
         gradient_checkpointing_kwargs=dict(use_reentrant=script_args.gradient_checkpointing_use_reentrant),
@@ -234,13 +237,10 @@ if __name__ == "__main__":
         model,
         ref_model=None,
         args=training_args,
-        beta=script_args.beta,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
-        max_prompt_length=script_args.max_prompt_length,
-        max_length=script_args.max_length,
     )
 
     # 6. train
