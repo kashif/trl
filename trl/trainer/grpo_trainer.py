@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import contextlib
 import functools
 import os
@@ -21,6 +22,7 @@ from collections import defaultdict
 from typing import Any, Callable, Optional, Sized, Union
 from unittest.mock import patch
 
+import openai
 import torch
 import torch.utils.data
 import transformers
@@ -58,6 +60,7 @@ from .utils import (
     print_prompt_completions_sample,
     selective_log_softmax,
 )
+from .vllm import start_vllm
 
 
 if is_peft_available():
@@ -163,7 +166,7 @@ class RepeatRandomSampler(Sampler):
         return self.num_samples * self.mini_repeat_count * self.repeat_count
 
 
-class GRPOTrainer(Trainer):
+class GRPOMuTrainer(Trainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://huggingface.co/papers/2402.03300).
@@ -1051,3 +1054,406 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+
+def get_iteration(output_dir: str) -> int:
+    os.makedirs(output_dir, exist_ok=True)
+    return max(
+        (
+            int(subdir)
+            for subdir in os.listdir(output_dir)
+            if os.path.isdir(os.path.join(output_dir, subdir)) and subdir.isdigit()
+        ),
+        default=0,
+    )
+
+
+def get_last_iteration_dir(output_dir: str) -> str | None:
+    last_iteration_dir = os.path.join(output_dir, f"{get_iteration(output_dir):04d}")
+    return last_iteration_dir if os.path.exists(last_iteration_dir) else None
+
+
+class GRPOTrainer:
+    def __init__(
+        self,
+        model: Union[str, PreTrainedModel],
+        reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        args: Optional[GRPOConfig] = None,
+        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
+        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
+        processing_class: Optional[PreTrainedTokenizerBase] = None,
+        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
+        callbacks: Optional[list[TrainerCallback]] = None,
+        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
+        peft_config: Optional["PeftConfig"] = None,
+    ):
+        self.grpo_config = args
+        self.model = model
+
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
+        self.processing_class = processing_class
+
+        if not isinstance(reward_funcs, list):
+            reward_funcs = [reward_funcs]
+        self.reward_funcs = reward_funcs
+
+        # Initialize reward weights
+        if args.reward_weights is not None:
+            if len(args.reward_weights) != len(reward_funcs):
+                raise ValueError(
+                    f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
+                    f"functions ({len(reward_funcs)})"
+                )
+            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
+        else:
+            self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
+
+        # Initialize reward processing classes
+        if reward_processing_classes is None:
+            reward_processing_classes = [None] * len(reward_funcs)
+        elif not isinstance(reward_processing_classes, list):
+            reward_processing_classes = [reward_processing_classes]
+        else:
+            if len(reward_processing_classes) != len(reward_funcs):
+                raise ValueError("The number of reward processing classes must match the number of reward functions.")
+
+        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+            if isinstance(reward_func, PreTrainedModel):
+                if reward_processing_class is None:
+                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+                if reward_processing_class.pad_token_id is None:
+                    reward_processing_class.pad_token = reward_processing_class.eos_token
+                # The reward model computes the reward for the latest non-padded token in the input sequence.
+                # So it's important to set the pad token ID to the padding token ID of the processing class.
+                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+                reward_processing_classes[i] = reward_processing_class
+        self.reward_processing_classes = reward_processing_classes
+
+        # Initialize tokenizer if not provided
+        if self.processing_class is None:
+            if isinstance(model, str):
+                self.processing_class = AutoTokenizer.from_pretrained(model, padding_side="left")
+            else:
+                self.processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+
+        self.num_iterations = args.num_iterations
+        self.output_dir = args.output_dir
+        self.gpu_memory_utilization = args.vllm_gpu_memory_utilization
+        self.max_model_len = args.vllm_max_model_len
+        self.expected_tokens = 1000
+        self.max_prompt_length = args.max_prompt_length
+        self.max_completion_length = args.max_completion_length
+        self.num_generations = args.num_generations
+
+    def prepare_dataset_for_generation(
+        self, dataset: Union[Dataset, IterableDataset], mode: str = "train"
+    ) -> list[dict]:
+        """
+        Prepares a dataset for generation by extracting and formatting prompts.
+
+        Args:
+            dataset: The dataset to prepare
+            mode: Either "train" or "eval"
+
+        Returns:
+            List of dictionaries containing formatted prompts and other metadata
+        """
+        prepared_data = []
+
+        for example in dataset:
+            prompt = example["prompt"]
+            prompt_text = maybe_apply_chat_template({"prompt": prompt}, self.processing_class)["prompt"]
+
+            # Tokenize prompt
+            prompt_inputs = self.processing_class(
+                prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+            )
+
+            prompt_ids = prompt_inputs["input_ids"]
+            prompt_mask = prompt_inputs["attention_mask"]
+
+            # Truncate if needed
+            if self.max_prompt_length is not None:
+                prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+                prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+            # Store all relevant information
+            prepared_example = {
+                "prompt_text": prompt_text,
+                "prompt_ids": prompt_ids,
+                "prompt_mask": prompt_mask,
+                "original_prompt": prompt,
+            }
+
+            # Store any additional columns from the dataset
+            for key in example:
+                if key not in ["prompt", "completion"]:
+                    prepared_example[key] = example[key]
+
+            prepared_data.append(prepared_example)
+
+        return prepared_data
+
+    def compute_rewards(self, prompts: list, completions: list, device="cuda") -> torch.Tensor:
+        """
+        Computes rewards for generated completions using the configured reward functions.
+
+        Args:
+            prompts: List of prompts
+            completions: List of completions
+            device: Device to place tensors on
+
+        Returns:
+            Tensor of shape (batch_size, num_reward_functions) containing rewards
+        """
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+
+        for i, (reward_func, reward_processing_class) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes)
+        ):
+            if isinstance(reward_func, nn.Module):
+                if is_conversational(prompts[0]):
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                else:
+                    texts = [p + c for p, c in zip(prompts, completions)]
+
+                reward_inputs = reward_processing_class(
+                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                ).to(device)
+
+                with torch.inference_mode():
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+            else:
+                # For custom reward functions
+                output_reward_func = reward_func(prompts=prompts, completions=completions)
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        return rewards_per_func
+
+    async def get_chat_completion(
+        self,
+        client,
+        prompt: str,
+        model: str = "gpt-4-turbo-preview",
+        temperature: float = 0.7,
+        max_tokens: int = 1000,
+        n: int = 1,
+        stop: Optional[Union[str, list[str]]] = None,
+        **kwargs
+    ) -> list[str]:
+        """Get chat completion from OpenAI API."""
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                n=n,
+                stop=stop,
+                **kwargs
+            )
+            return [choice.message.content for choice in response.choices]
+        except Exception as e:
+            print(f"Error in get_chat_completion: {e}")
+            return [""] * n
+        
+
+    async def generate_and_score_batch(
+        self,
+        semaphore: asyncio.Semaphore,
+        batch: list[dict],
+        client,
+        model: str = "gpt-4-turbo-preview",
+    ) -> list[dict]:
+        """
+        Asynchronously generates completions using OpenAI API for a batch of prompts and computes their rewards.
+        
+        Args:
+            semaphore: Semaphore for rate limiting
+            batch: List of prepared examples containing prompts
+            model: OpenAI model to use for generation
+            
+        Returns:
+            List of dictionaries containing the original data plus completions and rewards
+        """
+        async with semaphore:
+            tasks = []
+            for example in batch:
+                task = self.get_chat_completion(
+                    client,
+                    prompt=example["prompt_text"],
+                    model=model,
+                    temperature=self.grpo_config.temperature,
+                    max_tokens=self.max_completion_length,
+                    n=self.num_generations,
+                    top_p=self.grpo_config.top_p,
+                )
+                tasks.append(task)
+            
+            # Generate completions in parallel
+            completions_list = await asyncio.gather(*tasks)
+            
+            # Process outputs and compute rewards
+            for example, completions_texts in zip(batch, completions_list):
+                completions = []
+                completion_ids = []
+                
+                # Check if original_prompt is conversational
+                if isinstance(example["original_prompt"], str):
+                    is_chat = False
+                else:
+                    is_chat = is_conversational(example["original_prompt"])
+                
+                # Process each completion
+                for completion_text in completions_texts:
+                    if is_chat:
+                        bootstrap = example["original_prompt"][-1]["content"] if example["original_prompt"][-1]["role"] == "assistant" else ""
+                        completion = [{"role": "assistant", "content": bootstrap + completion_text}]
+                    else:
+                        completion = completion_text
+                        
+                    # Tokenize completion
+                    completion_tokens = self.processing_class(
+                        completion_text,
+                        return_tensors="pt",
+                        add_special_tokens=False
+                    )["input_ids"][0]
+                    
+                    completions.append(completion)
+                    completion_ids.append(completion_tokens.to("cuda"))
+                
+                # Pad completion IDs
+                completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+                
+                # Compute rewards
+                rewards_per_func = self.compute_rewards(
+                    [example["original_prompt"]] * len(completions),
+                    completions,
+                    device="cuda"
+                )
+                
+                # Apply reward weights and sum
+                rewards = (rewards_per_func * self.reward_weights.to("cuda").unsqueeze(0)).sum(dim=1)
+                
+                # Store results in the example
+                example["completion_ids"] = completion_ids
+                example["completions"] = completions
+                example["rewards"] = rewards
+                
+        return batch
+
+
+    async def prepare_training_data(
+        self,
+        client,
+        dataset: Union[Dataset, IterableDataset],
+        batch_size: int = 32,
+        mode: str = "train",
+        model: str = "gpt-4-turbo-preview",
+    ) -> list[dict]:
+        """
+        Prepares training data by generating completions and computing rewards in parallel.
+        
+        Args:
+            client: OpenAI client
+            dataset: Dataset to prepare
+            batch_size: Size of batches for processing
+            mode: Either "train" or "eval"
+            model: OpenAI model to use for generation
+            
+        Returns:
+            List of prepared examples with completions and rewards
+        """
+        # Prepare dataset
+        prepared_data = self.prepare_dataset_for_generation(dataset, mode)
+        
+        # Create batches
+        batches = [prepared_data[i:i + batch_size] for i in range(0, len(prepared_data), batch_size)]
+        
+        # Create semaphore for rate limiting (adjust based on OpenAI rate limits)
+        semaphore = asyncio.Semaphore(5)  # Conservative limit to avoid rate limiting
+        
+        # Process batches in parallel
+        tasks = [
+            self.generate_and_score_batch(semaphore, batch, client, model)
+            for batch in batches
+        ]
+        
+        results = await asyncio.gather(*tasks)
+        
+        # Flatten results
+        prepared_examples = [example for batch in results for example in batch]
+        
+        # Compute advantages
+        rewards = torch.cat([example["rewards"] for example in prepared_examples])
+        
+        # Reshape rewards for grouped statistics
+        grouped_rewards = rewards.view(-1, self.num_generations)
+        mean_grouped_rewards = grouped_rewards.mean(dim=1)
+        std_grouped_rewards = grouped_rewards.std(dim=1)
+        
+        # Expand means and stds to match original shape
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        
+        # Compute advantages
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        
+        # Store advantages in examples
+        for example, advantage in zip(prepared_examples, advantages):
+            example["advantage"] = advantage
+            
+        return prepared_examples
+
+    async def async_train(self) -> None:
+        model_name = get_last_iteration_dir(self.output_dir) or self.model.config._name_or_path
+
+        for i in range(get_iteration(self.output_dir), self.num_iterations):
+            vllm = await start_vllm(
+                model_name,
+                max_concurrent_requests=4096,
+                env={"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
+                named_arguments=dict(
+                    block_size=32,  # Token block size for contiguous chunks of tokens.
+                    disable_log_requests=True,
+                    enable_prefix_caching=True,
+                    enforce_eager=True,
+                    gpu_memory_utilization=self.gpu_memory_utilization,
+                    max_model_len=self.max_model_len if self.max_model_len else 16384,
+                    max_num_seqs=4096,
+                    max_num_batched_tokens=16384,
+                    num_scheduler_steps=16,
+                    preemption_mode="swap",
+                    return_tokens_as_token_ids=True,
+                    swap_space=2,
+                    tensor_parallel_size=torch.cuda.device_count() if torch.cuda.is_available() else 1,
+                ),
+            )
+
+            import pdb
+            pdb.set_trace()
+
+            train_examples = await self.prepare_training_data(
+                dataset=self.train_dataset, batch_size=self.grpo_config.per_device_train_batch_size, mode="train", model=vllm.model, client=vllm.client
+            )
+
+            val_examples = None
+            if self.val_dataset is not None:
+                val_examples = await self.prepare_training_data(
+                    dataset=self.val_dataset, batch_size=self.grpo_config.per_device_eval_batch_size, mode="eval", model=vllm.model, client=vllm.client
+                )
+
+            import pdb
+
+            pdb.set_trace()
+
+    def train(self):
+        asyncio.run(self.async_train())
+
+    def evaluate(self):
+        pass
+
+    def predict(self):
+        pass

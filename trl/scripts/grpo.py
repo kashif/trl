@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
@@ -50,9 +50,12 @@ def main(script_args, training_args, model_args):
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
     )
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        script_args.reward_model_name_or_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
-    )
+    # reward_model = AutoModelForSequenceClassification.from_pretrained(
+    #     script_args.reward_model_name_or_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+    # )
+    def reward_func(completions, **kwargs):
+        # Dummy reward function that rewards completions with more unique letters.
+        return [float(len(set(completion))) for completion in completions]
 
     # Load the dataset
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
@@ -60,7 +63,7 @@ def main(script_args, training_args, model_args):
     # Initialize the GRPO trainer
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=reward_model,
+        reward_funcs=reward_func,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
