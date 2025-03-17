@@ -38,7 +38,7 @@ async def start_vllm(
         try:
             sock.bind((named_arguments.get("host") or "0.0.0.0", port))
             break
-        except socket.error:
+        except OSError:
             if "port" in named_arguments and named_arguments["port"] == port:
                 raise RuntimeError(f"Port {port} is already in use")
             port += 1
@@ -90,9 +90,7 @@ async def start_vllm(
                     decoded_line,
                 )
                 if match:
-                    max_concurrent_tokens = int(
-                        int(match.group(1)) * float(match.group(2))
-                    )
+                    max_concurrent_tokens = int(int(match.group(1)) * float(match.group(2)))
         log.close()
 
     if process.stdout:
@@ -132,9 +130,7 @@ async def start_vllm(
     if max_concurrent_tokens is None:
         process.terminate()
         kill_vllm_workers()
-        raise RuntimeError(
-            "Max concurrent requests for the maximum model length not logged"
-        )
+        raise RuntimeError("Max concurrent requests for the maximum model length not logged")
     return vLLM(
         client,
         max_concurrent_tokens,
@@ -148,8 +144,7 @@ def kill_vllm_workers() -> None:
     pids = [
         line.split()[1]
         for line in result.stdout.splitlines()
-        if "from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd="
-        in line
+        if "from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=" in line
     ]
     for pid in pids:
         subprocess.run(["kill", "-9", pid], check=True)

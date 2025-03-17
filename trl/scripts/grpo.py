@@ -50,6 +50,7 @@ def main(script_args, training_args, model_args):
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
     )
+
     # reward_model = AutoModelForSequenceClassification.from_pretrained(
     #     script_args.reward_model_name_or_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
     # )
@@ -59,14 +60,25 @@ def main(script_args, training_args, model_args):
 
     # Load the dataset
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    # Load the dataset
+    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    # Take a small subset of both train and test splits
+    small_train_size = 50  # Adjust this number for your needs
+    small_test_size = 32  # Adjust this number for your needs
+
+    # Select subset while maintaining the dataset structure
+    small_dataset = {
+        script_args.dataset_train_split: dataset[script_args.dataset_train_split].select(range(small_train_size)),
+        script_args.dataset_test_split: dataset[script_args.dataset_test_split].select(range(small_test_size)),
+    }
 
     # Initialize the GRPO trainer
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=reward_func,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        train_dataset=small_dataset[script_args.dataset_train_split],
+        eval_dataset=small_dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
     )

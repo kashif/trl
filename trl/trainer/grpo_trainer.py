@@ -19,15 +19,14 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Sized, Union
+from typing import Callable, Optional, Sized, Union
 from unittest.mock import patch
 
-import openai
 import torch
 import torch.utils.data
 import transformers
 from accelerate import PartialState
-from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
+from accelerate.utils import is_peft_model, set_seed
 from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
 from packaging import version
@@ -48,8 +47,8 @@ from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from ..extras.profiling import profiling_context, profiling_decorator
-from ..import_utils import is_rich_available, is_vllm_available
+from ..extras.profiling import profiling_decorator
+from ..import_utils import is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
@@ -57,10 +56,9 @@ from .utils import (
     generate_model_card,
     get_comet_experiment_url,
     pad,
-    print_prompt_completions_sample,
     selective_log_softmax,
 )
-from .vllm import start_vllm, kill_vllm_workers
+from .vllm import kill_vllm_workers, start_vllm
 
 
 if is_peft_available():
@@ -375,8 +373,85 @@ class GRPOMuTrainer(Trainer):
         self.reward_processing_classes = reward_processing_classes
 
         # Data collator
-        def data_collator(features):  # No data collation is needed in GRPO
-            return features
+        def data_collator(features: list[dict]) -> dict:
+            if not isinstance(features[0], dict):
+                features = [vars(f) for f in features]
+            
+            # Get max lengths for padding
+            max_prompt_length = max(len(x["prompt_ids"]) for x in features)
+            max_completion_length = max(len(x["completion_ids"]) for x in features)
+            
+            batch = {
+                "prompt_ids": [],
+                "prompt_mask": [],
+                "completion_ids": [],
+                "completion_mask": [],
+                "advantages": [],
+            }
+
+            # Add ref_per_token_logps and old_per_token_logps if they exist in the first feature
+            if "ref_per_token_logps" in features[0]:
+                batch["ref_per_token_logps"] = []
+            if "old_per_token_logps" in features[0]:
+                batch["old_per_token_logps"] = []
+
+            for feature in features:
+                # Convert prompt_ids to tensor if it's not already
+                prompt_ids = torch.tensor(feature["prompt_ids"])
+                prompt_mask = torch.tensor(feature["prompt_mask"])
+                completion_ids = torch.tensor(feature["completion_ids"])
+                completion_mask = torch.tensor(feature["completion_mask"])
+        
+                
+                # Pad prompt_ids and mask
+                curr_prompt_length = len(prompt_ids)
+                if curr_prompt_length < max_prompt_length:
+                    pad_length = max_prompt_length - curr_prompt_length
+                    prompt_padding = torch.full(
+                        (pad_length,),
+                        self.processing_class.pad_token_id,
+                    )
+                    prompt_ids = torch.cat([prompt_padding, prompt_ids])
+                    mask_padding = torch.zeros(
+                        (pad_length,),
+                    )
+                    prompt_mask = torch.cat([mask_padding, prompt_mask])
+
+                # Pad completion_ids and mask
+                curr_completion_length = len(completion_ids)
+                if curr_completion_length < max_completion_length:
+                    pad_length = max_completion_length - curr_completion_length
+                    completion_padding = torch.full(
+                        (pad_length,),
+                        self.processing_class.pad_token_id,
+                    )
+                    completion_ids = torch.cat([completion_ids, completion_padding])
+                    mask_padding = torch.zeros(
+                        (pad_length,),
+                    )
+                    completion_mask = torch.cat([completion_mask, mask_padding])
+
+                # Add to batch
+                batch["prompt_ids"].append(prompt_ids)
+                batch["prompt_mask"].append(prompt_mask)
+                batch["completion_ids"].append(completion_ids)
+                batch["completion_mask"].append(completion_mask)
+                batch["advantages"].append(torch.tensor(feature["advantage"]))
+
+                # Add optional fields if they exist
+                if "ref_per_token_logps" in batch and "ref_per_token_logps" in feature:
+                    batch["ref_per_token_logps"].append(feature["ref_per_token_logps"])
+                if "old_per_token_logps" in batch and "old_per_token_logps" in feature:
+                    batch["old_per_token_logps"].append(feature["old_per_token_logps"])
+
+            # Stack all tensors
+            batch = {k: torch.stack(v) if len(v) > 0 else None for k, v in batch.items()}
+            
+            # Squeeze any single-dimension tensors
+            batch = {k: v.squeeze(1) if isinstance(v, torch.Tensor) and v.dim() > 2 else v 
+                    for k, v in batch.items()}
+
+            return batch
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
@@ -931,11 +1006,22 @@ class GRPOMuTrainer(Trainer):
             raise ValueError("The GRPOTrainer does not support returning outputs")
         # Compute the per-token log probabilities for the model
 
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        # Get shapes
+        _, num_generations, completion_length = inputs["completion_ids"].shape
+
+        # Reshape prompt tensors to match completion tensors
+        prompt_ids = inputs["prompt_ids"].unsqueeze(1).expand(-1, num_generations, -1)  # [B, G, P]
+        prompt_mask = inputs["prompt_mask"].unsqueeze(1).expand(-1, num_generations, -1)  # [B, G, P]
+
+        # Concatenate along sequence dimension
+        input_ids = torch.cat([prompt_ids, inputs["completion_ids"]], dim=2)  # [B, G, P+C]
+        attention_mask = torch.cat([prompt_mask, inputs["completion_mask"]], dim=2)  # [B, G, P+C]
+
+        # Reshape to 2D for model input
+        input_ids = input_ids.view(-1, input_ids.size(-1))  # [B*G, P+C]
+        attention_mask = attention_mask.view(-1, attention_mask.size(-1))  # [B*G, P+C]
+
+        logits_to_keep = completion_length  # we only need to compute the logits for the completion tokens
 
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
@@ -1241,7 +1327,7 @@ class GRPOTrainer:
         max_tokens: int = 1000,
         n: int = 1,
         stop: Optional[Union[str, list[str]]] = None,
-        **kwargs
+        **kwargs,
     ) -> list[str]:
         """Get chat completion from OpenAI API."""
         try:
@@ -1252,13 +1338,12 @@ class GRPOTrainer:
                 max_tokens=max_tokens,
                 n=n,
                 stop=stop,
-                **kwargs
+                **kwargs,
             )
             return [choice.message.content for choice in response.choices]
         except Exception as e:
             print(f"Error in get_chat_completion: {e}")
             return [""] * n
-        
 
     async def generate_and_score_batch(
         self,
@@ -1269,12 +1354,12 @@ class GRPOTrainer:
     ) -> list[dict]:
         """
         Asynchronously generates completions using OpenAI API for a batch of prompts and computes their rewards.
-        
+
         Args:
             semaphore: Semaphore for rate limiting
             batch: List of prepared examples containing prompts
             model: OpenAI model to use for generation
-            
+
         Returns:
             List of dictionaries containing the original data plus completions and rewards
         """
@@ -1291,120 +1376,115 @@ class GRPOTrainer:
                     top_p=self.grpo_config.top_p,
                 )
                 tasks.append(task)
-            
+
             # Generate completions in parallel
             completions_list = await asyncio.gather(*tasks)
-            
+
             # Process outputs and compute rewards
             for example, completions_texts in zip(batch, completions_list):
                 completions = []
                 completion_ids = []
-                
+
                 # Check if original_prompt is conversational
                 if isinstance(example["original_prompt"], str):
                     is_chat = False
                 else:
                     is_chat = is_conversational(example["original_prompt"])
-                
+
                 # Process each completion
                 for completion_text in completions_texts:
                     if is_chat:
-                        bootstrap = example["original_prompt"][-1]["content"] if example["original_prompt"][-1]["role"] == "assistant" else ""
+                        bootstrap = (
+                            example["original_prompt"][-1]["content"]
+                            if example["original_prompt"][-1]["role"] == "assistant"
+                            else ""
+                        )
                         completion = [{"role": "assistant", "content": bootstrap + completion_text}]
                     else:
                         completion = completion_text
-                        
+
                     # Tokenize completion
                     completion_tokens = self.processing_class(
-                        completion_text,
-                        return_tensors="pt",
-                        add_special_tokens=False
+                        completion_text, return_tensors="pt", add_special_tokens=False
                     )["input_ids"][0]
-                    
+
                     completions.append(completion)
                     completion_ids.append(completion_tokens.to("cuda"))
-                
+
                 # Pad completion IDs
                 completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
-                
+                # Create completion mask - mask everything after the first EOS token
+                is_eos = completion_ids == self.processing_class.eos_token_id
+                eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device="cuda")
+                eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+                sequence_indices = torch.arange(is_eos.size(1), device="cuda").expand(is_eos.size(0), -1)
+                completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
                 # Compute rewards
                 rewards_per_func = self.compute_rewards(
-                    [example["original_prompt"]] * len(completions),
-                    completions,
-                    device="cuda"
+                    [example["original_prompt"]] * len(completions), completions, device="cuda"
                 )
-                
+
                 # Apply reward weights and sum
                 rewards = (rewards_per_func * self.reward_weights.to("cuda").unsqueeze(0)).sum(dim=1)
-                
+
                 # Store results in the example
                 example["completion_ids"] = completion_ids
+                example["completion_mask"] = completion_mask
                 example["completions"] = completions
                 example["rewards"] = rewards
-                
-        return batch
 
+        return batch
+    
+    
 
     async def prepare_training_data(
         self,
         client,
         dataset: Union[Dataset, IterableDataset],
-        batch_size: int = 32,
         mode: str = "train",
         model: str = "gpt-4-turbo-preview",
     ) -> list[dict]:
         """
         Prepares training data by generating completions and computing rewards in parallel.
-        
+
         Args:
             client: OpenAI client
             dataset: Dataset to prepare
-            batch_size: Size of batches for processing
             mode: Either "train" or "eval"
             model: OpenAI model to use for generation
-            
+
         Returns:
             List of prepared examples with completions and rewards
         """
         # Prepare dataset
         prepared_data = self.prepare_dataset_for_generation(dataset, mode)
-        
-        # Create batches
-        batches = [prepared_data[i:i + batch_size] for i in range(0, len(prepared_data), batch_size)]
-        
+
         # Create semaphore for rate limiting (adjust based on OpenAI rate limits)
         semaphore = asyncio.Semaphore(5)  # Conservative limit to avoid rate limiting
-        
-        # Process batches in parallel
-        tasks = [
-            self.generate_and_score_batch(semaphore, batch, client, model)
-            for batch in batches
-        ]
-        
-        results = await asyncio.gather(*tasks)
-        
-        # Flatten results
-        prepared_examples = [example for batch in results for example in batch]
-        
+
+        # Process all examples at once
+        prepared_examples = await self.generate_and_score_batch(semaphore, prepared_data, client, model)
+
         # Compute advantages
         rewards = torch.cat([example["rewards"] for example in prepared_examples])
-        
+
         # Reshape rewards for grouped statistics
         grouped_rewards = rewards.view(-1, self.num_generations)
         mean_grouped_rewards = grouped_rewards.mean(dim=1)
         std_grouped_rewards = grouped_rewards.std(dim=1)
-        
+
         # Expand means and stds to match original shape
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        
+
         # Compute advantages
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-        
+
         # Store advantages in examples
         for example, advantage in zip(prepared_examples, advantages):
             example["advantage"] = advantage
-            
+
         return prepared_examples
 
     async def async_train(self) -> None:
@@ -1433,19 +1513,20 @@ class GRPOTrainer:
             )
 
             train_examples = await self.prepare_training_data(
-                dataset=self.train_dataset, batch_size=self.grpo_config.per_device_train_batch_size, mode="train", model=vllm.model, client=vllm.client
+                dataset=self.train_dataset, mode="train", model=vllm.model, client=vllm.client
             )
 
             eval_examples = None
             if self.eval_dataset is not None:
                 eval_examples = await self.prepare_training_data(
-                    dataset=self.eval_dataset, batch_size=self.grpo_config.per_device_eval_batch_size, mode="eval", model=vllm.model, client=vllm.client
+                    dataset=self.eval_dataset, mode="eval", model=vllm.model, client=vllm.client
                 )
 
             vllm.process.terminate()
             kill_vllm_workers()
 
             import pdb
+
             pdb.set_trace()
 
             grpo_trainer = GRPOMuTrainer(
@@ -1453,10 +1534,8 @@ class GRPOTrainer:
                 reward_funcs=self.reward_funcs,
                 args=self.grpo_config,
                 train_dataset=Dataset.from_list(train_examples),
-                
             )
             grpo_trainer.train()
-
 
             import pdb
 
