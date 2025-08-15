@@ -143,6 +143,9 @@ class GRPOConfig(TrainingArguments):
 
         > Parameters that control the training
 
+        context_parallel_size (`int`, *optional*, defaults to `1`):
+            The size of the context parallel group for sequence parallelism. When > 1, sequences are sharded across
+            multiple GPUs to enable training on extremely long contexts. Requires accelerate>=1.10.0.
         beta (`float`, *optional*, defaults to `0.0`):
             KL coefficient. If `0.0` (default), the reference model is not loaded, reducing memory usage and improving
             training speed.
@@ -449,6 +452,13 @@ class GRPOConfig(TrainingArguments):
     )
 
     # Parameters that control the training
+    context_parallel_size: int = field(
+        default=1,
+        metadata={
+            "help": "The size of the context parallel group for sequence parallelism. When > 1, sequences are "
+            "sharded across multiple GPUs to enable training on extremely long contexts. Requires accelerate>=1.10.0."
+        },
+    )
     beta: float = field(
         default=0.0,
         metadata={
@@ -592,22 +602,35 @@ class GRPOConfig(TrainingArguments):
         super().__post_init__()
 
         num_processes = self.world_size
+        # Account for context parallelism in batch size calculations
+        # When using context parallelism, processes are grouped and share the same data
+        if self.context_parallel_size > 1:
+            # Number of context parallel groups
+            num_cp_groups = num_processes // self.context_parallel_size
+            effective_num_processes = num_cp_groups
+        else:
+            effective_num_processes = num_processes
+
         # The current default effective batch size
         if self.generation_batch_size is None and self.steps_per_generation is None:
             self.steps_per_generation = self.gradient_accumulation_steps
-            self.generation_batch_size = self.per_device_train_batch_size * num_processes * self.steps_per_generation
+            self.generation_batch_size = (
+                self.per_device_train_batch_size * effective_num_processes * self.steps_per_generation
+            )
         elif self.generation_batch_size is not None and self.steps_per_generation is None:
             # Just ensure the value is divisible by the global batch size
-            if self.generation_batch_size % (self.per_device_train_batch_size * num_processes) != 0:
+            if self.generation_batch_size % (self.per_device_train_batch_size * effective_num_processes) != 0:
                 raise ValueError(
-                    f"generation_batch_size ({self.generation_batch_size}) must be divisible by the global batch size "
-                    f"({self.per_device_train_batch_size * num_processes})."
+                    f"generation_batch_size ({self.generation_batch_size}) must be divisible by the effective batch size "
+                    f"({self.per_device_train_batch_size * effective_num_processes})."
                 )
             self.steps_per_generation = self.generation_batch_size // (
-                self.per_device_train_batch_size * num_processes
+                self.per_device_train_batch_size * effective_num_processes
             )
         elif self.generation_batch_size is None and self.steps_per_generation is not None:
-            self.generation_batch_size = self.per_device_train_batch_size * num_processes * self.steps_per_generation
+            self.generation_batch_size = (
+                self.per_device_train_batch_size * effective_num_processes * self.steps_per_generation
+            )
         else:
             raise ValueError(
                 "'generation_batch_size' and 'steps_per_generation' can not be both configured at the same time"
@@ -629,3 +652,11 @@ class GRPOConfig(TrainingArguments):
 
         if self.delta is not None and self.use_liger_loss:
             raise ValueError("Liger loss does not support two-sided GRPO loss yet.")
+
+        # Validate context_parallel_size
+        if self.context_parallel_size > 1:
+            if num_processes % self.context_parallel_size != 0:
+                raise ValueError(
+                    f"Number of processes ({num_processes}) must be divisible by context_parallel_size "
+                    f"({self.context_parallel_size})."
+                )

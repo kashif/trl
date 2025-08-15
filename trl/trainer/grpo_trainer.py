@@ -686,6 +686,9 @@ class GRPOTrainer(Trainer):
         # This acts as a flag to indicate that the warning has already been issued.
         model.warnings_issued["estimate_tokens"] = True
 
+        # Store context parallel size for later use
+        self.context_parallel_size = args.context_parallel_size
+
         super().__init__(
             model=model,
             args=args,
@@ -1048,6 +1051,32 @@ class GRPOTrainer(Trainer):
         return entropy_mask & mask.bool()  # ensure padding tokens are always masked out
 
     @profiling_decorator
+    def create_accelerator_and_postprocess(self):
+        """Override to add ParallelismConfig support for context parallelism."""
+        # Set up ParallelismConfig if context parallelism is enabled
+        if self.args.context_parallel_size > 1:
+            from accelerate import ParallelismConfig
+
+            # Create ParallelismConfig with context parallelism
+            parallelism_config = ParallelismConfig(
+                cp_size=self.args.context_parallel_size,
+            )
+
+            # Store the original accelerator_config
+            original_kwargs = self.args.accelerator_config
+
+            # Add parallelism_config to accelerator kwargs
+            self.args.accelerator_config["parallelism_config"] = parallelism_config
+
+            # Call parent's create_accelerator_and_postprocess
+            super().create_accelerator_and_postprocess()
+
+            # Restore original config to avoid side effects
+            self.args.accelerator_config = original_kwargs
+        else:
+            # No context parallelism, use default behavior
+            super().create_accelerator_and_postprocess()
+
     def _get_per_token_logps_and_entropies(
         self,
         model,
@@ -1824,17 +1853,36 @@ class GRPOTrainer(Trainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            compute_entropy=True,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            pixel_attention_mask=inputs.get("pixel_attention_mask"),
-            image_sizes=inputs.get("image_sizes"),
-        )
+        # Wrap with context parallelism if enabled
+        if self.context_parallel_size > 1 and hasattr(self.accelerator, "maybe_context_parallel"):
+            # Context parallel sharding for long sequences
+            with self.accelerator.maybe_context_parallel(
+                buffers=[input_ids, attention_mask],
+                buffer_seq_dims=[1, 1],  # Sequence dimension is 1 for both tensors
+            ):
+                per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+                    model,
+                    input_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    compute_entropy=True,
+                    pixel_values=inputs.get("pixel_values"),
+                    image_grid_thw=inputs.get("image_grid_thw"),
+                    pixel_attention_mask=inputs.get("pixel_attention_mask"),
+                    image_sizes=inputs.get("image_sizes"),
+                )
+        else:
+            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+                compute_entropy=True,
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                pixel_attention_mask=inputs.get("pixel_attention_mask"),
+                image_sizes=inputs.get("image_sizes"),
+            )
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
