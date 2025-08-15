@@ -1451,20 +1451,51 @@ class GRPOTrainer(Trainer):
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             if self.vllm_mode == "server":
-                all_prompts_text = gather_object(prompts_text)
-                if has_images:
-                    all_images = gather_object(images)
+                # Handle context parallelism: only collect prompts from CP group leaders
+                if self.context_parallel_size > 1:
+                    # Calculate CP group info
+                    cp_group_id = self.accelerator.process_index // self.context_parallel_size
+                    cp_local_rank = self.accelerator.process_index % self.context_parallel_size
+                    num_cp_groups = self.accelerator.num_processes // self.context_parallel_size
+
+                    # Only CP group leaders (local rank 0) contribute prompts
+                    if cp_local_rank == 0:
+                        # This is a CP group leader, contribute prompts
+                        contributed_prompts = prompts_text
+                        contributed_images = images if has_images else None
+                    else:
+                        # This is not a CP group leader, contribute empty
+                        contributed_prompts = []
+                        contributed_images = [] if has_images else None
+
+                    # Gather prompts only from CP group leaders
+                    all_prompts_text = gather_object(contributed_prompts)
+                    if has_images:
+                        all_images = gather_object(contributed_images)
+                else:
+                    # No context parallelism, use original behavior
+                    all_prompts_text = gather_object(prompts_text)
+                    if has_images:
+                        all_images = gather_object(images)
 
                 if self.accelerator.is_main_process:
-                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                    # prompt individually.
-                    ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+                    if self.context_parallel_size > 1:
+                        # With CP: prompts from CP leaders contain num_generations duplicates
+                        # We need to take unique prompts across all CP groups
+                        ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
 
-                    if has_images:
-                        ordered_set_of_images = all_images[:: self.num_generations]
+                        if has_images:
+                            ordered_set_of_images = all_images[:: self.num_generations]
+                        else:
+                            ordered_set_of_images = None
                     else:
-                        ordered_set_of_images = None
+                        # Original behavior without CP
+                        ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+
+                        if has_images:
+                            ordered_set_of_images = all_images[:: self.num_generations]
+                        else:
+                            ordered_set_of_images = None
 
                     with profiling_context(self, "vLLM.generate"):
                         completion_ids = self.vllm_client.generate(
@@ -1481,15 +1512,35 @@ class GRPOTrainer(Trainer):
                             generation_kwargs=self.args.generation_kwargs,
                         )
                 else:
-                    completion_ids = [None] * len(all_prompts_text)
-                # Broadcast the completions from the main process to all processes, ensuring each process receives its
-                # corresponding slice.
+                    # Non-main processes get None, will be filled by broadcast
+                    if self.context_parallel_size > 1:
+                        # Calculate expected length based on CP groups
+                        num_cp_groups = self.accelerator.num_processes // self.context_parallel_size
+                        completion_ids = [None] * (len(prompts_text) * num_cp_groups)
+                    else:
+                        completion_ids = [None] * len(all_prompts_text)
+
+                # Broadcast the completions from the main process to all processes
                 completion_ids = broadcast_object_list(completion_ids, from_process=0)
-                process_slice = slice(
-                    self.accelerator.process_index * len(prompts),
-                    (self.accelerator.process_index + 1) * len(prompts),
-                )
-                completion_ids = completion_ids[process_slice]
+
+                # Handle slicing based on context parallelism
+                if self.context_parallel_size > 1:
+                    # With CP: all ranks in same CP group get identical completions
+                    cp_group_id = self.accelerator.process_index // self.context_parallel_size
+
+                    # Calculate slice for this CP group
+                    cp_group_slice = slice(
+                        cp_group_id * len(prompts),
+                        (cp_group_id + 1) * len(prompts),
+                    )
+                    completion_ids = completion_ids[cp_group_slice]
+                else:
+                    # Original behavior without CP
+                    process_slice = slice(
+                        self.accelerator.process_index * len(prompts),
+                        (self.accelerator.process_index + 1) * len(prompts),
+                    )
+                    completion_ids = completion_ids[process_slice]
 
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":

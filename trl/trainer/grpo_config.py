@@ -660,3 +660,10 @@ class GRPOConfig(TrainingArguments):
                     f"Number of processes ({num_processes}) must be divisible by context_parallel_size "
                     f"({self.context_parallel_size})."
                 )
+
+            # Context parallelism is not supported with vLLM colocate mode
+            if self.vllm_mode and self.vllm_mode == "colocate":
+                raise ValueError(
+                    "Context parallelism (context_parallel_size > 1) is not supported with "
+                    "vllm_mode='colocate'. Use vllm_mode='server' instead for context parallelism."
+                )
