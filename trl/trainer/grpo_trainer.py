@@ -784,7 +784,7 @@ class GRPOTrainer(BaseTrainer):
     @profiling_decorator
     def _get_last_hidden_state(
         self,
-        unwrapped_model,
+        model,
         input_ids,
         attention_mask,
         logits_to_keep,
@@ -793,9 +793,6 @@ class GRPOTrainer(BaseTrainer):
         pixel_attention_mask=None,
         image_sizes=None,
     ):
-        if is_peft_model(unwrapped_model):
-            unwrapped_model = unwrapped_model.base_model.model
-
         # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
 
@@ -818,8 +815,14 @@ class GRPOTrainer(BaseTrainer):
             model_inputs["logits_to_keep"] = logits_to_keep + 1
 
         model_inputs["use_cache"] = False  # only used in generation; set False to suppress warnings
+        model_inputs["output_hidden_states"] = True  # Request hidden states from the model
 
-        last_hidden_state = unwrapped_model.model(**model_inputs).last_hidden_state
+        # Use the full model forward pass to get hidden states
+        # This goes through gradient checkpointing and other training wrappers
+        # Note: With logits_to_keep, the model only computes logits for the last N tokens,
+        # so the full [B, T, V] tensor is NOT materialized - only [B, logits_to_keep, V]
+        outputs = model(**model_inputs)
+        last_hidden_state = outputs.hidden_states[-1]
         # Exclude the last value: it corresponds to the next token pred
         last_hidden_state = last_hidden_state[:, :-1, :]  # (B, L-1, H)
         # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
@@ -1783,7 +1786,7 @@ class GRPOTrainer(BaseTrainer):
             output["num_images"] = num_images
         return output
 
-    def compute_liger_loss(self, unwrapped_model, inputs):
+    def compute_liger_loss(self, model, unwrapped_model, inputs):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -1791,9 +1794,15 @@ class GRPOTrainer(BaseTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # Get the last hidden state of the model
+        # For PEFT models, we need to access the base model to get lm_head
+        # Use unwrapped_model for lm_head access (handles FSDP properly)
+        lm_head_model = unwrapped_model.base_model.model if is_peft_model(unwrapped_model) else unwrapped_model
+
+        # Get the last hidden state using the wrapped model's inner transformer
+        # This calls model.model (e.g., Qwen2Model) to avoid materializing the full logits tensor
+        # Using the wrapped model preserves training wrappers (gradient checkpointing, etc.)
         last_hidden_state = self._get_last_hidden_state(
-            unwrapped_model,
+            model,  # Use the wrapped model to preserve training wrappers
             input_ids,
             attention_mask,
             logits_to_keep,
@@ -1803,16 +1812,30 @@ class GRPOTrainer(BaseTrainer):
             inputs.get("image_sizes"),
         )
 
+        # For dapo/cispo loss, we need to pass num_items_in_batch for proper normalization
+        # This matches TRL's native implementation which normalizes by num_items_in_batch / num_processes
+        num_items_in_batch = None
+        if self.loss_type in ["dapo", "cispo"]:
+            num_items_in_batch = inputs["num_items_in_batch"] / self.accelerator.num_processes
+
+        # Get vLLM importance sampling ratio if available
+        # This corrects for the mismatch between vLLM completion logprobs and recomputed training logprobs
+        importance_sampling_ratio = None
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            importance_sampling_ratio = inputs.get("importance_sampling_ratio")
+
         # compute loss and metrics using liger grpo loss
         loss, metrics = self.liger_grpo_loss(
             _input=last_hidden_state,
-            lin_weight=unwrapped_model.lm_head.weight,
+            lin_weight=lm_head_model.lm_head.weight,
             selected_token_ids=completion_ids,
             attention_mask=completion_mask,
             advantages=inputs["advantages"],
-            bias=unwrapped_model.lm_head.bias,
+            bias=lm_head_model.lm_head.bias,
             old_per_token_logps=inputs.get("old_per_token_logps"),
             ref_per_token_logps=inputs.get("ref_per_token_logps"),
+            num_items_in_batch=num_items_in_batch,
+            importance_sampling_ratio=importance_sampling_ratio,
         )
         # Extract metrics from the liger_grpo_loss output
         # KL divergence is the first metric when beta is non-zero
@@ -1823,7 +1846,13 @@ class GRPOTrainer(BaseTrainer):
         if self.beta != 0.0:
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
-        return loss / self.current_gradient_accumulation_steps
+
+        # For dapo/cispo, TRL's native implementation does NOT divide by gradient_accumulation_steps
+        # For other loss types (grpo, bnpo, dr_grpo), we need to divide
+        if self.loss_type in ["dapo", "cispo"]:
+            return loss
+        else:
+            return loss / self.current_gradient_accumulation_steps
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1832,7 +1861,9 @@ class GRPOTrainer(BaseTrainer):
         if self.use_liger_kernel:
             # Compute the loss using the liger grpo loss
             unwrapped_model = self.accelerator.unwrap_model(model)
-            return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
+            return self._forward_redirection(
+                model, unwrapped_model, self.compute_liger_loss, model, unwrapped_model, inputs
+            )
         else:
             return self._compute_loss(model, inputs)
 
