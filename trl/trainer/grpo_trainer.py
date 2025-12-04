@@ -785,6 +785,7 @@ class GRPOTrainer(BaseTrainer):
     def _get_last_hidden_state(
         self,
         model,
+        unwrapped_model,
         input_ids,
         attention_mask,
         logits_to_keep,
@@ -821,6 +822,7 @@ class GRPOTrainer(BaseTrainer):
         # This goes through gradient checkpointing and other training wrappers
         # Note: With logits_to_keep, the model only computes logits for the last N tokens,
         # so the full [B, T, V] tensor is NOT materialized - only [B, logits_to_keep, V]
+        # This preserves training wrappers while minimizing logits computation
         outputs = model(**model_inputs)
         last_hidden_state = outputs.hidden_states[-1]
         # Exclude the last value: it corresponds to the next token pred
@@ -1020,10 +1022,12 @@ class GRPOTrainer(BaseTrainer):
                         self._sync_fsdp2_params_to_vllm(self.model)
                 else:
                     # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in self.model.named_parameters():
+                    # When using liger kernel, unwrap the model to get actual parameters for weight syncing
+                    model_for_sync = self.accelerator.unwrap_model(self.model) if self.use_liger_kernel else self.model
+                    for name, param in model_for_sync.named_parameters():
                         # When using PEFT, we need to recover the original parameter name and discard some parameters
                         name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        if self.model.prefix in name:
+                        if model_for_sync.prefix in name:
                             continue
                         # When module to save, remove its prefix and discard the original module
                         if "original_module" in name:
@@ -1048,7 +1052,11 @@ class GRPOTrainer(BaseTrainer):
                 elif fsdp_version == 2:
                     self._sync_fsdp2_params_to_vllm(self.model)
             else:
-                for name, param in self.model.named_parameters():
+                # For non-FSDP, non-PEFT models
+                # When using liger kernel, unwrap the model to get actual parameters for weight syncing
+                # This ensures we access the correct parameters in both server and colocate modes
+                model_for_sync = self.accelerator.unwrap_model(self.model) if self.use_liger_kernel else self.model
+                for name, param in model_for_sync.named_parameters():
                     name = self._fix_param_name_to_vllm(name)
                     with gather_if_zero3([param]):
                         if self.vllm_mode == "server" and self.accelerator.is_main_process:
@@ -1798,11 +1806,12 @@ class GRPOTrainer(BaseTrainer):
         # Use unwrapped_model for lm_head access (handles FSDP properly)
         lm_head_model = unwrapped_model.base_model.model if is_peft_model(unwrapped_model) else unwrapped_model
 
-        # Get the last hidden state using the wrapped model's inner transformer
+        # Get the last hidden state using the wrapped model to preserve training wrappers
         # This calls model.model (e.g., Qwen2Model) to avoid materializing the full logits tensor
         # Using the wrapped model preserves training wrappers (gradient checkpointing, etc.)
         last_hidden_state = self._get_last_hidden_state(
             model,  # Use the wrapped model to preserve training wrappers
+            unwrapped_model,
             input_ids,
             attention_mask,
             logits_to_keep,
