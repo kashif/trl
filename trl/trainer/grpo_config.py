@@ -13,8 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-
-from transformers import TrainingArguments
+from typing import Any
 
 from .base_config import _BaseConfig
 
@@ -114,7 +113,7 @@ class GRPOConfig(_BaseConfig):
         use_vllm (`bool`, *optional*, defaults to `False`):
             Whether to use vLLM for generating completions. If set to `True`, the trainer will use vLLM for generation
             instead of the default model.generate(). Requires `vllm` to be installed.
-        vllm_mode (`str`, *optional*, defaults to `"server"`):
+        vllm_mode (`str`, *optional*, defaults to `"colocate"`):
             Mode to use for vLLM integration when `use_vllm` is set to `True`. Must be one of `"server"` or
             `"colocate"`.
 
@@ -187,6 +186,19 @@ class GRPOConfig(_BaseConfig):
         sapo_temperature_pos (`float`, *optional*, defaults to `1.0`):
             Temperature for tokens with positive advantage scores used in the `sapo` loss function. This parameter is
             introduced in the [Soft Adaptive Policy Optimization paper](https://huggingface.co/papers/2511.20347).
+        vespo_k_pos (`float`, *optional*, defaults to `2.0`):
+            k parameter for positive advantages, it is the power exponent in the VESPO loss. Controls how aggressively
+            we down-weight samples with low importance weights (when the importance sampling ratio < 1).
+        vespo_lambda_pos (`float`, *optional*, defaults to `3.0`):
+            lambda parameter for positive advantages, it is the decay factor in the VESPO loss. Controls how
+            aggressively we down-weight samples with high importance weights (when the importance sampling ratio > 1).
+        vespo_k_neg (`float`, *optional*, defaults to `3.0`):
+            k parameter for negative advantages, it is the power exponent in the VESPO loss. Controls how aggressively
+            we down-weight samples with low importance weights (when the importance sampling ratio < 1).
+        vespo_lambda_neg (`float`, *optional*, defaults to `2.0`):
+            lambda parameter for negative advantages, it is the exponential decay factor in the VESPO loss. Controls
+            how aggressively we down-weight samples with high importance weights (when the importance sampling ratio >
+            1).
         importance_sampling_level (`str`, *optional*, defaults to `"token"`):
             Controls whether importance sampling ratios are computed at the `"token"` or `"sequence"` level. `"token"`
             keeps the raw per-token log-probability ratios (one weight per token). `"sequence"` averages the
@@ -244,6 +256,9 @@ class GRPOConfig(_BaseConfig):
               sequence's loss by its length. This is a modification of GSPO and requires
               `importance_sampling_level="sequence"`. Introduced in the [LUSPO
               paper](https://huggingface.co/papers/2602.05261).
+            - `"vespo"`: Variational Sequence-Level Soft Policy Optimization. Replaces hard clipping with a smooth,
+              asymmetric Gamma weighting function applied directly to sequence-level importance weights. Introduced in
+              the [VESPO paper](https://huggingface.co/papers/2602.10693).
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
@@ -323,7 +338,7 @@ class GRPOConfig(_BaseConfig):
     > - `learning_rate`: Defaults to `1e-6` instead of `5e-5`.
     """
 
-    _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs"]
+    _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + ["model_init_kwargs"]
 
     # Parameters whose default values are overridden from TrainingArguments
     learning_rate: float = field(
@@ -332,7 +347,7 @@ class GRPOConfig(_BaseConfig):
     )
 
     # Parameters that control the model and reference model
-    model_init_kwargs: dict | str | None = field(
+    model_init_kwargs: dict[str, Any] | str | None = field(
         default=None,
         metadata={
             "help": "Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the `model` "
@@ -485,7 +500,7 @@ class GRPOConfig(_BaseConfig):
         },
     )
     vllm_mode: str = field(
-        default="server",
+        default="colocate",
         metadata={
             "help": "Mode to use for vLLM integration when `use_vllm` is set to `True`. Must be one of `'server'` or "
             "`'colocate'`. `'server'`: The trainer will send generation requests to a separate vLLM server. Make sure "
@@ -620,6 +635,36 @@ class GRPOConfig(_BaseConfig):
             "paper](https://huggingface.co/papers/2511.20347)."
         },
     )
+    vespo_k_pos: float = field(
+        default=2.0,
+        metadata={
+            "help": "k parameter for positive advantages, it is the power exponent in the VESPO loss. Controls how "
+            "aggressively we down-weight samples with low importance weights (when the importance sampling ratio < 1)."
+        },
+    )
+    vespo_lambda_pos: float = field(
+        default=3.0,
+        metadata={
+            "help": "lambda parameter for positive advantages, it is the decay factor in the VESPO loss. Controls "
+            "how aggressively we down-weight samples with high importance weights (when the importance sampling ratio "
+            "> 1)."
+        },
+    )
+    vespo_k_neg: float = field(
+        default=3.0,
+        metadata={
+            "help": "k parameter for negative advantages, it is the power exponent in the VESPO loss. Controls how "
+            "aggressively we down-weight samples with low importance weights (when the importance sampling ratio < 1)."
+        },
+    )
+    vespo_lambda_neg: float = field(
+        default=2.0,
+        metadata={
+            "help": "lambda parameter for negative advantages, it is the exponential decay factor in the VESPO loss. "
+            "Controls how aggressively we down-weight samples with high importance weights (when the importance "
+            "sampling ratio > 1)."
+        },
+    )
     importance_sampling_level: str = field(
         default="token",
         metadata={
@@ -691,6 +736,9 @@ class GRPOConfig(_BaseConfig):
             "sequence's loss by its length. This is a modification of GSPO and requires "
             "`importance_sampling_level='sequence'`. Introduced in the [LUSPO "
             "paper](https://huggingface.co/papers/2602.05261)."
+            "'vespo': Variational Sequence-Level Soft Policy Optimization. Replaces hard clipping with a smooth, "
+            "asymmetric Gamma weighting function applied directly to sequence-level importance weights. Introduced in "
+            "the [VESPO paper](https://huggingface.co/papers/2602.10693)."
         },
     )
     mask_truncated_completions: bool = field(

@@ -165,6 +165,24 @@ trainer = GRPOTrainer(
 )
 ```
 
+### INTELLECT-2: A Reasoning Model Trained Through Globally Decentralized Reinforcement Learning
+
+**📜 Paper**: https://huggingface.co/papers/2505.07291
+
+INTELLECT-2 is the first globally distributed reinforcement learning training run of a 32 billion parameter language model using fully asynchronous RL across a dynamic, heterogeneous swarm of permissionless compute contributors. The authors propose modifications to the standard GRPO training recipe, including two-sided GRPO clipping for increased training stability. To reproduce the paper's setting, use this configuration:
+
+```python
+from trl import GRPOConfig
+
+training_args = GRPOConfig(
+    delta=4,  # δ in section 4.1 of the paper
+    epsilon=0.2,  # ε in section 4.1 of the paper
+    beta=0.001,  # KL divergence coefficient in section 4.1 of the paper
+    num_generations=16,  # responses per prompt in section 4.1 of the paper
+    learning_rate=3e-7,  # section 4.1 of the paper
+)
+```
+
 ### Beyond the 80/20 Rule: High-Entropy Minority Tokens Drive Effective Reinforcement Learning for LLM Reasoning
 
 **📜 Paper**: https://huggingface.co/papers/2506.01939
@@ -573,23 +591,63 @@ training_args = GRPOConfig(
 )
 ```
 
-### INTELLECT-2: A Reasoning Model Trained Through Globally Decentralized Reinforcement Learning
+### VESPO: Variational Sequence-Level Soft Policy Optimization for Stable Off-Policy LLM Training
 
-**📜 Paper**: https://huggingface.co/papers/2505.07291
+**📜 Paper**: https://huggingface.co/papers/2602.10693
 
-INTELLECT-2 is the first globally distributed reinforcement learning training run of a 32 billion parameter language model using fully asynchronous RL across a dynamic, heterogeneous swarm of permissionless compute contributors. The authors propose modifications to the standard GRPO training recipe, including two-sided GRPO clipping for increased training stability. To reproduce the paper's setting, use this configuration:
+VESPO addresses training instability in off-policy RL caused by policy staleness, asynchronous updates, and train-inference mismatches. Rather than relying on heuristic token-level clipping (GRPO) or sequence-length normalization (GSPO), VESPO derives a principled reshaping kernel from a variational framework. In practice, this yields a smooth, asymmetric Gamma weighting function that gracefully suppresses extreme sequence-level importance weights without introducing length bias.
+
+$$
+\mathcal{L}_{\text{VESPO}}(\theta) = - \mathbb{E}_{\tau \sim \mu} \left[ \underbrace{W(\tau)^{k} \cdot \exp\left(\lambda
+(1 - W(\tau))\right)}_{\phi(W) \text{ detached }} \cdot \mathcal{A}(\tau) \cdot \log \pi_\theta(\tau) \right]
+$$
+
+with  \\( W(\tau) = \frac{\pi_\theta(\tau)}{\mu(\tau)} \\) the sequence level importance ratio, and  \\( \phi(W) \\) is detached from the computation graph to serve as a gradient scaling coefficient.
 
 ```python
 from trl import GRPOConfig
 
 training_args = GRPOConfig(
-    delta=4,  # δ in section 4.1 of the paper
-    epsilon=0.2,  # ε in section 4.1 of the paper
-    beta=0.001,  # KL divergence coefficient in section 4.1 of the paper
-    num_generations=16,  # responses per prompt in section 4.1 of the paper
-    learning_rate=3e-7,  # section 4.1 of the paper
+    loss_type="vespo",
+    use_vllm=True,  # or False if not using any token-level `vllm_importance_sampling_correction` methods
+    vllm_importance_sampling_mode="token_truncate",  # default correction mode for VESPO, `token_mask` also supported
+    vespo_k_pos=2.0,  # power exponent (c1 in paper Section 3.4) for positive advantages
+    vespo_lambda_pos=3.0,  # decay factor (c2 in paper Section 3.4) for positive advantages
+    vespo_k_neg=3.0,  # power exponent (c1 in paper Section 3.4) for negative advantages
+    vespo_lambda_neg=2.0,  # decay factor (c2 in paper Section 3.4) for negative advantages
 )
 ```
+
+
+### Rethinking the Trust Region in LLM Reinforcement Learning
+
+**📜 Paper**: https://huggingface.co/papers/2602.04879
+
+DPPO replaces PPO/GRPO's heuristic ratio-clipping with a principled trust region based on direct policy divergence estimates. PPO-style clipping masks tokens based on the probability ratio π/μ, which over-penalizes low-probability tokens and under-penalizes high-probability ones. DPPO instead masks based on direct approximations of policy divergence (TV or KL), ensuring updates stay within a theoretically grounded trust region. Four divergence approximations are supported: `binary_tv`, `binary_kl`, `topk_tv`, and `topk_kl`.
+
+```python
+from trl.experimental.dppo import DPPOConfig, DPPOTrainer
+
+training_args = DPPOConfig(
+    divergence_type="binary_tv",  # divergence approximation
+    divergence_topk=20,  # K for top-K divergence modes (Section 7 / Appendix G.2 of the paper)
+    epsilon=0.15,  # δ_low threshold (Appendix F of the paper)
+    epsilon_high=0.15,  # δ_high threshold (Appendix F of the paper)
+    clip_ratio_c=20.0,  # IS ratio upper bound C (Section 5.4 of the paper)
+    beta=0.0,  # KL regularization coefficient
+    use_vllm=True,
+)
+
+trainer = DPPOTrainer(
+    model="your-model",
+    reward_funcs=[...],
+    args=training_args,
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+The official code [sail-sg/Stable-RL](https://github.com/sail-sg/Stable-RL)
 
 ## Direct Policy Optimization
 
@@ -1137,6 +1195,22 @@ SFTConfig(
     # Target batch size 256; achieved via per-device batch 8 * grad accumulation 32
     per_device_train_batch_size=8,
     gradient_accumulation_steps=32,
+)
+```
+
+### Fewer Truncations Improve Language Modeling
+
+**📜 Paper**: https://huggingface.co/papers/2404.10830
+
+The paper shows that the standard concatenate-then-split preprocessing (`packing_strategy="wrapped"`) used for LLM training causes many documents to be arbitrarily truncated, which harms learning. It proposes packing document chunks into context windows using a Best-Fit Decreasing bin-packing algorithm, greatly reducing truncation while keeping high token utilization and improving model performance. TRL implements this as the `"bfd_split"` packing strategy in [`SFTConfig`]. For more details on packing, see the [SFT documentation](sft_trainer#packing).
+
+```python
+from trl import SFTConfig
+
+training_args = SFTConfig(
+    packing=True,
+    packing_strategy="bfd_split",
+    max_length=4096,
 )
 ```
 

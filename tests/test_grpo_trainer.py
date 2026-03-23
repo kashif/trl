@@ -165,17 +165,44 @@ class TestGetHighEntropyMask(TrlTestCase):
 class TestGRPORolloutDispatch:
     def _make_trainer(self):
         trainer = object.__new__(GRPOTrainer)
-        trainer.accelerator = SimpleNamespace(device=torch.device("cpu"), is_main_process=True)
+        trainer.accelerator = SimpleNamespace(
+            device=torch.device("cpu"),
+            is_main_process=True,
+            gather=lambda t: t,
+        )
         trainer.args = SimpleNamespace(report_to=[])
         trainer.model = SimpleNamespace(training=True)
-        trainer.state = SimpleNamespace(global_step=2)
+        trainer.state = SimpleNamespace(global_step=2, num_input_tokens_seen=0)
         trainer._last_loaded_step = 1
         trainer.use_vllm = False
         trainer.use_transformers_paged = False
         trainer.vllm_generation = SimpleNamespace(sync_weights=MagicMock())
+        trainer.processing_class = SimpleNamespace(
+            batch_decode=MagicMock(return_value=["decoded"]),
+        )
+        trainer.tools = None
+        trainer.eos_token_id = 2
+        trainer.pad_token_id = 0
+        trainer._metrics = {
+            "train": {
+                "num_tokens": [],
+                **{
+                    k: []
+                    for k in [
+                        "completions/mean_length",
+                        "completions/min_length",
+                        "completions/max_length",
+                        "completions/clipped_ratio",
+                        "completions/mean_terminated_length",
+                        "completions/min_terminated_length",
+                        "completions/max_terminated_length",
+                    ]
+                },
+            }
+        }
         return trainer
 
-    def test_generate_single_turn_prefers_rollout_func(self):
+    def test_generate_prefers_rollout_func(self):
         trainer = self._make_trainer()
         trainer.rollout_func = MagicMock(
             return_value={
@@ -186,33 +213,32 @@ class TestGRPORolloutDispatch:
             }
         )
 
-        prompt_ids, completion_ids, logprobs, extra_fields = trainer._generate_single_turn(["prompt"])
+        result = trainer._generate(["prompt"])
 
-        assert prompt_ids == [[1]]
-        assert completion_ids == [[2]]
-        assert logprobs == [[-0.1]]
-        assert extra_fields == {"env_mask": [[1]]}
+        assert result[0] == [[1]]  # prompt_ids
+        assert result[1] == [[2]]  # completion_ids
+        assert result[2] == [[1]]  # tool_mask (from env_mask)
         trainer.rollout_func.assert_called_once_with(["prompt"], trainer)
 
-    def test_generate_single_turn_rollout_func_syncs_vllm_weights_when_needed(self):
+    def test_generate_rollout_func_syncs_vllm_weights_when_needed(self):
         trainer = self._make_trainer()
         trainer.use_vllm = True
         trainer.rollout_func = MagicMock(
             return_value={"prompt_ids": [[1]], "completion_ids": [[2]], "logprobs": [[0.0]]}
         )
 
-        trainer._generate_single_turn(["prompt"])
+        trainer._generate(["prompt"])
 
         trainer.vllm_generation.sync_weights.assert_called_once()
         assert trainer._last_loaded_step == trainer.state.global_step
         trainer.rollout_func.assert_called_once_with(["prompt"], trainer)
 
-    def test_generate_single_turn_rollout_func_raises_when_required_keys_are_missing(self):
+    def test_generate_rollout_func_raises_when_required_keys_are_missing(self):
         trainer = self._make_trainer()
         trainer.rollout_func = MagicMock(return_value={"prompt_ids": [[1]], "completion_ids": [[2]]})
 
         with pytest.raises(ValueError, match="rollout_func must return keys"):
-            trainer._generate_single_turn(["prompt"])
+            trainer._generate(["prompt"])
 
 
 class TestGRPOTrainer(TrlTestCase):
@@ -255,7 +281,7 @@ class TestGRPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
-    @pytest.mark.parametrize("loss_type", ["bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo"])
+    @pytest.mark.parametrize("loss_type", ["bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"])
     def test_training_loss_types(self, loss_type):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -1740,9 +1766,9 @@ class TestGRPOTrainer(TrlTestCase):
 
         training_args = GRPOConfig(
             output_dir=self.tmp_dir,
-            per_device_train_batch_size=2,
-            num_generations=2,
-            max_completion_length=8,
+            per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
+            num_generations=3,  # reduce the number of generations to reduce memory usage
+            max_completion_length=8,  # reduce the completion length to reduce memory usage
             report_to="none",
         )
         trainer = GRPOTrainer(
@@ -1752,6 +1778,59 @@ class TestGRPOTrainer(TrlTestCase):
             train_dataset=dataset,
         )
         trainer.train()
+
+    def test_training_reward_func_with_log_extra(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        def reward_func(completions, **kwargs):
+            log_extra = kwargs.get("log_extra")
+            assert log_extra is not None
+            log_extra("test_column", [completion[:5] for completion in completions])
+            return [float(len(completion)) for completion in completions]
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
+            num_generations=3,  # reduce the number of generations to reduce memory usage
+            max_completion_length=8,  # reduce the completion length to reduce memory usage
+            report_to="none",
+            log_completions=True,
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs=reward_func,
+            args=training_args,
+            train_dataset=dataset,
+        )
+        trainer.train()
+        assert "test_column" in trainer._logs["extra"]
+
+    def test_training_reward_func_with_log_metric(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        def reward_func(completions, **kwargs):
+            log_metric = kwargs.get("log_metric")
+            assert log_metric is not None
+            log_metric("custom_accuracy", 0.75)
+            return [float(len(completion)) for completion in completions]
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
+            num_generations=3,  # reduce the number of generations to reduce memory usage
+            max_completion_length=8,  # reduce the completion length to reduce memory usage
+            report_to="none",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs=reward_func,
+            args=training_args,
+            train_dataset=dataset,
+        )
+        trainer.train()
+        # log_metric appends to _metrics, which gets averaged and merged into log_history
+        logged_keys = {k for entry in trainer.state.log_history for k in entry}
+        assert "custom_accuracy" in logged_keys
 
     def test_prepare_input_called_with_correct_data(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
