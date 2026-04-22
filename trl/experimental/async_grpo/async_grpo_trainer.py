@@ -120,6 +120,45 @@ class _EmptyIterableDataset(torch.utils.data.IterableDataset):
         return iter([])
 
 
+class _KondoGateState:
+    """Per-sample Kondo gate on delight (https://huggingface.co/papers/2603.20526).
+
+    Maintains a ring buffer of past sample-level delight values, computes an adaptive threshold
+    λ = quantile_{1−ρ}(history), and draws a Bernoulli gate with probability σ((χ − λ) / η). The
+    caller must pass a delight that has already been reduced across DP ranks; combined with an
+    identically-seeded generator on every rank, this guarantees that every rank produces the same
+    decision — required to keep DDP / FSDP collectives in sync across a training step.
+    """
+
+    def __init__(
+        self, rate: float, temperature: float, history_size: int, warmup: int, device: torch.device, seed: int
+    ):
+        self.rate = rate
+        self.temperature = temperature
+        self.warmup = warmup
+        self._history_size = history_size
+        self._buffer = torch.zeros(history_size, device=device)
+        self._count = 0
+        self._write_idx = 0
+        self._generator = torch.Generator(device=device).manual_seed(int(seed))
+
+    def _append(self, value: torch.Tensor) -> None:
+        self._buffer[self._write_idx] = value.detach().reshape(())
+        self._write_idx = (self._write_idx + 1) % self._history_size
+        self._count = min(self._count + 1, self._history_size)
+
+    def decide(self, sample_delight: torch.Tensor) -> tuple[bool, float, float]:
+        """Returns (should_backward, gate_prob, lambda). Assumes sample_delight is already cross-rank reduced."""
+        self._append(sample_delight)
+        if self._count < self.warmup or self.rate >= 1.0:
+            return True, 1.0, float("-inf")
+        history = self._buffer[: self._count]
+        lam = torch.quantile(history, 1.0 - self.rate)
+        prob = torch.sigmoid((sample_delight.reshape(()) - lam) / self.temperature)
+        gate = torch.bernoulli(prob, generator=self._generator)
+        return bool(gate.item()), float(prob.item()), float(lam.item())
+
+
 @dataclass
 class DataCollatorForRollout(DataCollatorMixin):
     pad_token_id: int
@@ -345,6 +384,20 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._train_tokens_start_time = None
         self.model_version = 0
+
+        # Kondo gate (https://huggingface.co/papers/2603.20526): per-sample Bernoulli gate that skips the
+        # full forward + backward pass for low-delight samples. Seeded identically on every rank so that
+        # all ranks make the same gating decision and distributed collectives stay in sync.
+        self._kondo_gate = None
+        if self.args.use_kondo_gate:
+            self._kondo_gate = _KondoGateState(
+                rate=self.args.kondo_gate_rate,
+                temperature=self.args.kondo_gate_temperature,
+                history_size=self.args.kondo_gate_history_size,
+                warmup=self.args.kondo_gate_warmup,
+                device=self.accelerator.device,
+                seed=self.args.seed,
+            )
         # Create worker and queue on rank 0
         if self.accelerator.is_main_process:
             if self.train_dataset is None:
@@ -463,6 +516,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
         completion_mask = completion_mask[:, 1:]
         old_log_probs = old_log_probs[:, 1:]
         advantages = advantages.unsqueeze(1)
+        if self.args.use_delight:
+            # Delightful Policy Gradient gate (https://huggingface.co/papers/2603.14608); η=1 per the paper.
+            advantages = advantages * torch.sigmoid(-advantages * log_probs.detach())
         log_ratio = log_probs - old_log_probs
         ratio = torch.exp(log_ratio)
         clipped = torch.clamp(ratio, 1 - self.epsilon_low, 1 + self.epsilon_high)
@@ -545,6 +601,29 @@ class AsyncGRPOTrainer(_BaseTrainer):
             # NOTE: in dynamic mbs setup, we would need to agg across DP ranks.
             self._metrics["train"]["train_seq_len"].append(float(local_max_len))
         return loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # Kondo gate: cheap screening via the pre-computed rollout `old_log_probs` as a proxy for
+        # current-policy surprisal (paper §3.2 shows approximate delight is sufficient). When gated
+        # out, we skip `super().training_step` entirely — saving both the forward and backward pass.
+        if self._kondo_gate is not None:
+            inputs = self._prepare_inputs(inputs)
+            advantages = inputs["advantages"]
+            completion_mask = inputs["completion_mask"][:, 1:]
+            old_log_probs = inputs["old_log_probs"][:, 1:]
+            mask_sum = completion_mask.sum(-1).clamp(min=1.0)
+            per_sample_surprisal = -(old_log_probs * completion_mask).sum(-1) / mask_sum
+            per_sample_delight = advantages * per_sample_surprisal
+            batch_delight = per_sample_delight.mean()
+            batch_delight = self.accelerator.reduce(batch_delight.detach(), reduction="mean")
+            should_backward, prob, lam = self._kondo_gate.decide(batch_delight)
+            self._metrics["train"]["kondo_gate/backward_frac"].append(float(should_backward))
+            self._metrics["train"]["kondo_gate/prob"].append(prob)
+            if math.isfinite(lam):
+                self._metrics["train"]["kondo_gate/lambda"].append(lam)
+            if not should_backward:
+                return torch.zeros((), device=self.accelerator.device)
+        return super().training_step(model, inputs, num_items_in_batch)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"

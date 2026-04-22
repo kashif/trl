@@ -58,6 +58,26 @@ class AsyncGRPOConfig(_BaseConfig):
             Lower-bound epsilon value for clipping.
         epsilon_high (`float`, *optional*, defaults to `0.2`):
             Upper-bound epsilon value for clipping.
+        use_delight (`bool`, *optional*, defaults to `False`):
+            Whether to gate per-token policy-gradient terms with the Delightful Policy Gradient sigmoid of
+            delight = advantage × surprisal, as introduced in the [Delightful Policy Gradient
+            paper](https://huggingface.co/papers/2603.14608). Temperature η is fixed at 1.
+        use_kondo_gate (`bool`, *optional*, defaults to `False`):
+            Whether to enable the per-sample Kondo gate introduced in the [Does This Gradient Spark Joy?
+            paper](https://huggingface.co/papers/2603.20526). When enabled, each training step draws a Bernoulli
+            gate on the sample-level delight; gated-out steps skip the full forward and backward pass. The
+            surprisal used for screening is the pre-computed `old_log_probs` from the rollout (§3.2 of the paper
+            shows approximate delight is sufficient for screening).
+        kondo_gate_rate (`float`, *optional*, defaults to `1.0`):
+            Target fraction ρ of training steps that receive a backward pass. `1.0` is a no-op even when the gate
+            is enabled. Smaller values keep only the highest-delight samples.
+        kondo_gate_temperature (`float`, *optional*, defaults to `1.0`):
+            Temperature η in the Kondo gate Bernoulli probability σ((χ − λ) / η).
+        kondo_gate_history_size (`int`, *optional*, defaults to `1024`):
+            Size of the ring buffer of past sample delights used to compute the adaptive threshold
+            λ = quantile_{1−ρ}.
+        kondo_gate_warmup (`int`, *optional*, defaults to `128`):
+            Never gate until the history contains at least this many sample delights.
 
         > Parameters that control the async rollout pipeline
 
@@ -157,6 +177,41 @@ class AsyncGRPOConfig(_BaseConfig):
         default=0.2,
         metadata={"help": "Upper-bound epsilon value for clipping."},
     )
+    use_delight: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to gate per-token policy-gradient terms with the Delightful Policy Gradient sigmoid "
+            "of delight = advantage × surprisal (https://huggingface.co/papers/2603.14608). Temperature η is fixed "
+            "at 1."
+        },
+    )
+    use_kondo_gate: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to enable the per-sample Kondo gate (https://huggingface.co/papers/2603.20526). When "
+            "enabled, each training step draws a Bernoulli gate on the sample-level delight; gated-out steps skip "
+            "the full forward and backward pass. Uses `old_log_probs` from the rollout as the surprisal proxy."
+        },
+    )
+    kondo_gate_rate: float = field(
+        default=1.0,
+        metadata={
+            "help": "Target fraction ρ of training steps that receive a backward pass. 1.0 is a no-op. Smaller "
+            "values keep only the highest-delight samples."
+        },
+    )
+    kondo_gate_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Temperature η in the Kondo gate Bernoulli probability σ((χ − λ) / η)."},
+    )
+    kondo_gate_history_size: int = field(
+        default=1024,
+        metadata={"help": "Size of the ring buffer of past sample delights used to compute λ = quantile_{1−ρ}."},
+    )
+    kondo_gate_warmup: int = field(
+        default=128,
+        metadata={"help": "Never gate until the history contains at least this many sample delights."},
+    )
 
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
@@ -200,6 +255,19 @@ class AsyncGRPOConfig(_BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.use_kondo_gate:
+            if not (0.0 < self.kondo_gate_rate <= 1.0):
+                raise ValueError(f"`kondo_gate_rate` must be in (0, 1], got {self.kondo_gate_rate}")
+            if self.kondo_gate_temperature <= 0.0:
+                raise ValueError(f"`kondo_gate_temperature` must be > 0, got {self.kondo_gate_temperature}")
+            if self.kondo_gate_warmup <= 0:
+                raise ValueError(f"`kondo_gate_warmup` must be > 0, got {self.kondo_gate_warmup}")
+            if self.kondo_gate_history_size < self.kondo_gate_warmup:
+                raise ValueError(
+                    f"`kondo_gate_history_size` ({self.kondo_gate_history_size}) must be >= "
+                    f"`kondo_gate_warmup` ({self.kondo_gate_warmup})."
+                )
 
         # Accelerator config: required for the async IterableDataset-backed dataloader to work correctly.
         # split_batches=True and dispatch_batches=True ensure that the main process drives the dataloader
