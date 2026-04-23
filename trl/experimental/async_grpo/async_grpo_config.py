@@ -76,7 +76,7 @@ class AsyncGRPOConfig(_BaseConfig):
         kondo_gate_history_size (`int`, *optional*, defaults to `1024`):
             Size of the ring buffer of past sample delights used to compute the adaptive threshold
             λ = quantile_{1−ρ}.
-        kondo_gate_warmup (`int`, *optional*, defaults to `128`):
+        kondo_gate_warmup (`int`, *optional*, defaults to `32`):
             Never gate until the history contains at least this many sample delights.
 
         > Parameters that control the async rollout pipeline
@@ -209,7 +209,7 @@ class AsyncGRPOConfig(_BaseConfig):
         metadata={"help": "Size of the ring buffer of past sample delights used to compute λ = quantile_{1−ρ}."},
     )
     kondo_gate_warmup: int = field(
-        default=128,
+        default=32,
         metadata={"help": "Never gate until the history contains at least this many sample delights."},
     )
 
