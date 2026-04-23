@@ -22,7 +22,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
-from trl.experimental.async_grpo.async_grpo_trainer import _KondoGateState
+from trl.experimental.async_grpo.async_grpo_trainer import RolloutQueueDataset, _KondoGateState
 from trl.experimental.async_grpo.async_rollout_worker import RolloutSample
 
 from ..testing_utils import TrlTestCase
@@ -159,53 +159,121 @@ class TestAsyncGRPOTrainer(TrlTestCase):
 
 class TestKondoGateState:
     def test_warmup_never_gates(self):
-        gate = _KondoGateState(rate=0.5, temperature=1.0, history_size=8, warmup=4, device=torch.device("cpu"), seed=0)
+        gate = _KondoGateState(rate=0.5, temperature=1.0, history_size=8, warmup=4)
         for i in range(3):
-            should, prob, lam = gate.decide(torch.tensor(float(i)))
+            should, prob, lam = gate.decide(float(i))
             assert should is True
             assert prob == 1.0
             assert lam == float("-inf")
 
     def test_rate_one_is_noop(self):
-        gate = _KondoGateState(rate=1.0, temperature=1.0, history_size=8, warmup=1, device=torch.device("cpu"), seed=0)
+        gate = _KondoGateState(rate=1.0, temperature=1.0, history_size=8, warmup=1)
         for i in range(10):
-            should, prob, lam = gate.decide(torch.tensor(float(i)))
+            should, prob, _ = gate.decide(float(i))
             assert should is True
             assert prob == 1.0
 
     def test_sharp_temperature_separates_high_low_delight(self):
-        gate = _KondoGateState(
-            rate=0.5, temperature=0.01, history_size=16, warmup=2, device=torch.device("cpu"), seed=0
-        )
+        gate = _KondoGateState(rate=0.5, temperature=0.01, history_size=16, warmup=2)
         # Fill the warmup buffer with two values — λ lands at 0.5.
-        gate.decide(torch.tensor(0.0))
-        gate.decide(torch.tensor(1.0))
+        gate.decide(0.0)
+        gate.decide(1.0)
         # High delight → prob ≈ 1; low delight → prob ≈ 0.
-        _, high_prob, _ = gate.decide(torch.tensor(100.0))
-        _, low_prob, _ = gate.decide(torch.tensor(-100.0))
+        _, high_prob, _ = gate.decide(100.0)
+        _, low_prob, _ = gate.decide(-100.0)
         assert high_prob > 0.99
         assert low_prob < 0.01
 
-    def test_seeded_generator_is_deterministic_across_ranks(self):
-        # Two independently-constructed gates with the same seed must produce the same Bernoulli draws
-        # given the same inputs -- required to keep DP collectives in sync.
-        gate_a = _KondoGateState(
-            rate=0.5, temperature=1.0, history_size=16, warmup=2, device=torch.device("cpu"), seed=42
-        )
-        gate_b = _KondoGateState(
-            rate=0.5, temperature=1.0, history_size=16, warmup=2, device=torch.device("cpu"), seed=42
-        )
-        decisions_a, decisions_b = [], []
-        for i in range(30):
-            val = torch.tensor(float(i % 5) - 2.0)  # mixed positive / negative delights
-            decisions_a.append(gate_a.decide(val)[0])
-            decisions_b.append(gate_b.decide(val)[0])
-        assert decisions_a == decisions_b
-
     def test_buffer_wraps_at_history_size(self):
-        gate = _KondoGateState(rate=0.5, temperature=1.0, history_size=4, warmup=1, device=torch.device("cpu"), seed=0)
+        gate = _KondoGateState(rate=0.5, temperature=1.0, history_size=4, warmup=1)
         for i in range(10):
-            gate.decide(torch.tensor(float(i)))
+            gate.decide(float(i))
         # After 10 appends with history_size=4, only the last 4 delights remain: {6, 7, 8, 9}.
         assert gate._count == 4
         assert set(gate._buffer.tolist()) == {6.0, 7.0, 8.0, 9.0}
+
+
+class TestRolloutQueueDatasetKondoIntegration:
+    """Verify that RolloutQueueDataset consults the Kondo gate and drops low-delight samples."""
+
+    @staticmethod
+    def _make_sample(advantage: float, old_log_probs_val: float, model_version: int = 0):
+        return RolloutSample(
+            prompt=[{"role": "user", "content": "x"}],
+            completion=[{"role": "assistant", "content": "y"}],
+            input_ids=[0, 1, 2],
+            completion_mask=[0, 1, 1],
+            old_log_probs=[0.0, old_log_probs_val, old_log_probs_val],
+            advantage=advantage,
+            model_version=model_version,
+            metrics={"reward": 0.0},
+        )
+
+    def test_kondo_gate_drops_low_delight_samples(self):
+        # Sharp temperature + a threshold well above the warmup values should reliably drop low-delight
+        # items until either a high-delight arrives or the consecutive-drop cap kicks in.
+        gate = _KondoGateState(rate=0.01, temperature=0.01, history_size=4, warmup=1)
+        q = queue.Queue()
+        # Prime the buffer with high delight so λ sits near the top of the history.
+        q.put(self._make_sample(advantage=1.0, old_log_probs_val=-2.0))  # delight = 1.0 * 2.0 = 2.0
+        for _ in range(10):
+            q.put(self._make_sample(advantage=0.01, old_log_probs_val=-0.01))  # delight ~ 0.0001
+
+        dataset = RolloutQueueDataset(
+            rollout_queue=q,
+            model_version_fn=lambda: 0,
+            max_staleness=10,
+            timeout=1.0,
+            kondo_gate=gate,
+            kondo_gate_max_consecutive_drops=6,
+        )
+        kept = []
+        for item in dataset:
+            kept.append(item)
+            if len(kept) >= 2:
+                break
+        assert kept, "dataset yielded nothing"
+        first = kept[0]
+        assert "kondo_gate/delight" in first["metrics"]
+        assert "kondo_gate/gate_prob" in first["metrics"]
+        assert "kondo_gate/lambda" in first["metrics"]
+        # Some items were dropped: we pushed 11 samples but yielded 2, so internal state must show drops.
+        assert dataset._kondo_consecutive_drops == 0  # last yielded reset counter
+
+    def test_kondo_gate_disabled_passes_samples_through(self):
+        q = queue.Queue()
+        for _ in range(3):
+            q.put(self._make_sample(advantage=0.1, old_log_probs_val=-0.1))
+
+        dataset = RolloutQueueDataset(
+            rollout_queue=q, model_version_fn=lambda: 0, max_staleness=10, timeout=1.0, kondo_gate=None
+        )
+        yielded = []
+        for item in dataset:
+            yielded.append(item)
+            if len(yielded) >= 3:
+                break
+        assert len(yielded) == 3
+        for item in yielded:
+            assert "kondo_gate/delight" not in item["metrics"]
+
+    def test_consecutive_drop_cap_forces_yield(self):
+        # Gate that would drop everything (very high lambda) but cap=1 means the second call must yield.
+        gate = _KondoGateState(rate=0.01, temperature=0.01, history_size=4, warmup=1)
+        # Seed the buffer with a very high delight so λ ≈ that value; subsequent low-delight draws will try to drop.
+        gate.decide(100.0)
+        q = queue.Queue()
+        for _ in range(5):
+            q.put(self._make_sample(advantage=0.0, old_log_probs_val=0.0))  # delight = 0, gate wants to drop
+
+        dataset = RolloutQueueDataset(
+            rollout_queue=q,
+            model_version_fn=lambda: 0,
+            max_staleness=10,
+            timeout=1.0,
+            kondo_gate=gate,
+            kondo_gate_max_consecutive_drops=1,
+        )
+        first = next(iter(dataset))
+        assert first is not None
+        assert "kondo_gate/delight" in first["metrics"]

@@ -77,12 +77,71 @@ class StepIntervalCallback(TrainerCallback):
             self.fn()
 
 
+class _KondoGateState:
+    """Per-sample Kondo gate on delight (https://huggingface.co/papers/2603.20526).
+
+    Maintains a ring buffer of past sample-level delight values, computes an adaptive threshold λ =
+    quantile_{1−ρ}(history), and draws a Bernoulli gate with probability σ((χ − λ) / η). In the async_grpo pipeline
+    this is invoked from `RolloutQueueDataset` on the main process only — Accelerate dispatches the already-filtered
+    batches to every rank, so no cross-rank synchronization is required.
+    """
+
+    def __init__(self, rate: float, temperature: float, history_size: int, warmup: int):
+        self.rate = rate
+        self.temperature = temperature
+        self.warmup = warmup
+        self._history_size = history_size
+        self._buffer = torch.zeros(history_size)
+        self._count = 0
+        self._write_idx = 0
+
+    def _append(self, value: torch.Tensor) -> None:
+        self._buffer[self._write_idx] = value
+        self._write_idx = (self._write_idx + 1) % self._history_size
+        self._count = min(self._count + 1, self._history_size)
+
+    def decide(self, sample_delight: float) -> tuple[bool, float, float]:
+        """Returns (should_keep, gate_prob, lambda)."""
+        chi = torch.tensor(float(sample_delight))
+        self._append(chi)
+        if self._count < self.warmup or self.rate >= 1.0:
+            return True, 1.0, float("-inf")
+        history = self._buffer[: self._count]
+        lam = torch.quantile(history, 1.0 - self.rate)
+        prob = torch.sigmoid((chi - lam) / self.temperature)
+        gate = torch.bernoulli(prob)
+        return bool(gate.item()), float(prob.item()), float(lam.item())
+
+
 class RolloutQueueDataset(torch.utils.data.IterableDataset):
-    def __init__(self, rollout_queue, model_version_fn, max_staleness=3, timeout=120.0):
+    def __init__(
+        self,
+        rollout_queue,
+        model_version_fn,
+        max_staleness=3,
+        timeout=120.0,
+        kondo_gate: _KondoGateState | None = None,
+        kondo_gate_max_consecutive_drops: int = 128,
+    ):
         self.queue = rollout_queue
         self.model_version_fn = model_version_fn
         self.max_staleness = max_staleness
         self.timeout = timeout
+        self.kondo_gate = kondo_gate
+        self.kondo_gate_max_consecutive_drops = kondo_gate_max_consecutive_drops
+        self._kondo_consecutive_drops = 0
+
+    @staticmethod
+    def _approx_sample_delight(sample) -> float:
+        # Paper §3.2: approximate delight (using the pre-computed rollout `old_log_probs` as a proxy
+        # for current-policy surprisal) is sufficient for screening.
+        cm = sample.completion_mask
+        olp = sample.old_log_probs
+        total = sum(cm)
+        if total <= 0:
+            return 0.0
+        mean_surprisal = -sum(o * m for o, m in zip(olp, cm, strict=False)) / total
+        return float(sample.advantage) * float(mean_surprisal)
 
     def __iter__(self):
         while True:
@@ -104,12 +163,28 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                 logger.info(f"dropping stale sample (staleness={staleness}, max={self.max_staleness})")
                 continue  # drop stale, pull next
 
+            kondo_metrics: dict[str, float] = {}
+            if self.kondo_gate is not None:
+                delight = self._approx_sample_delight(sample)
+                should_keep, prob, lam = self.kondo_gate.decide(delight)
+                if not should_keep and self._kondo_consecutive_drops < self.kondo_gate_max_consecutive_drops:
+                    # Drop low-delight samples; fall through after too many in a row to avoid starving the trainer.
+                    self._kondo_consecutive_drops += 1
+                    continue
+                self._kondo_consecutive_drops = 0
+                kondo_metrics = {
+                    "kondo_gate/delight": delight,
+                    "kondo_gate/gate_prob": prob,
+                    # λ is -inf during warmup; use NaN so `log()` filters it out of aggregated metrics.
+                    "kondo_gate/lambda": lam if math.isfinite(lam) else float("nan"),
+                }
+
             yield {
                 "input_ids": sample.input_ids,
                 "completion_mask": sample.completion_mask,
                 "old_log_probs": sample.old_log_probs,
                 "advantage": sample.advantage,
-                "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s},
+                "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s, **kondo_metrics},
             }
 
 
@@ -118,45 +193,6 @@ class _EmptyIterableDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         return iter([])
-
-
-class _KondoGateState:
-    """Per-sample Kondo gate on delight (https://huggingface.co/papers/2603.20526).
-
-    Maintains a ring buffer of past sample-level delight values, computes an adaptive threshold
-    λ = quantile_{1−ρ}(history), and draws a Bernoulli gate with probability σ((χ − λ) / η). The
-    caller must pass a delight that has already been reduced across DP ranks; combined with an
-    identically-seeded generator on every rank, this guarantees that every rank produces the same
-    decision — required to keep DDP / FSDP collectives in sync across a training step.
-    """
-
-    def __init__(
-        self, rate: float, temperature: float, history_size: int, warmup: int, device: torch.device, seed: int
-    ):
-        self.rate = rate
-        self.temperature = temperature
-        self.warmup = warmup
-        self._history_size = history_size
-        self._buffer = torch.zeros(history_size, device=device)
-        self._count = 0
-        self._write_idx = 0
-        self._generator = torch.Generator(device=device).manual_seed(int(seed))
-
-    def _append(self, value: torch.Tensor) -> None:
-        self._buffer[self._write_idx] = value.detach().reshape(())
-        self._write_idx = (self._write_idx + 1) % self._history_size
-        self._count = min(self._count + 1, self._history_size)
-
-    def decide(self, sample_delight: torch.Tensor) -> tuple[bool, float, float]:
-        """Returns (should_backward, gate_prob, lambda). Assumes sample_delight is already cross-rank reduced."""
-        self._append(sample_delight)
-        if self._count < self.warmup or self.rate >= 1.0:
-            return True, 1.0, float("-inf")
-        history = self._buffer[: self._count]
-        lam = torch.quantile(history, 1.0 - self.rate)
-        prob = torch.sigmoid((sample_delight.reshape(()) - lam) / self.temperature)
-        gate = torch.bernoulli(prob, generator=self._generator)
-        return bool(gate.item()), float(prob.item()), float(lam.item())
 
 
 @dataclass
@@ -385,19 +421,20 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self._train_tokens_start_time = None
         self.model_version = 0
 
-        # Kondo gate (https://huggingface.co/papers/2603.20526): per-sample Bernoulli gate that skips the
-        # full forward + backward pass for low-delight samples. Seeded identically on every rank so that
-        # all ranks make the same gating decision and distributed collectives stay in sync.
-        self._kondo_gate = None
-        if self.args.use_kondo_gate:
-            self._kondo_gate = _KondoGateState(
+        # Kondo gate (https://huggingface.co/papers/2603.20526): dequeue-time filter that drops
+        # low-delight samples at the rollout queue. Runs inside `RolloutQueueDataset` on the main
+        # process only; Accelerate dispatches the filtered stream of batches to every rank, so no
+        # cross-rank synchronization is needed.
+        self._kondo_gate = (
+            _KondoGateState(
                 rate=self.args.kondo_gate_rate,
                 temperature=self.args.kondo_gate_temperature,
                 history_size=self.args.kondo_gate_history_size,
                 warmup=self.args.kondo_gate_warmup,
-                device=self.accelerator.device,
-                seed=self.args.seed,
             )
+            if self.args.use_kondo_gate
+            else None
+        )
         # Create worker and queue on rank 0
         if self.accelerator.is_main_process:
             if self.train_dataset is None:
@@ -454,6 +491,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 model_version_fn=lambda: self.model_version,
                 max_staleness=self.args.max_staleness,
                 timeout=self.args.vllm_server_timeout,
+                kondo_gate=self._kondo_gate,
             )
         else:
             dataset = _EmptyIterableDataset()
@@ -601,29 +639,6 @@ class AsyncGRPOTrainer(_BaseTrainer):
             # NOTE: in dynamic mbs setup, we would need to agg across DP ranks.
             self._metrics["train"]["train_seq_len"].append(float(local_max_len))
         return loss
-
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        # Kondo gate: cheap screening via the pre-computed rollout `old_log_probs` as a proxy for
-        # current-policy surprisal (paper §3.2 shows approximate delight is sufficient). When gated
-        # out, we skip `super().training_step` entirely — saving both the forward and backward pass.
-        if self._kondo_gate is not None:
-            inputs = self._prepare_inputs(inputs)
-            advantages = inputs["advantages"]
-            completion_mask = inputs["completion_mask"][:, 1:]
-            old_log_probs = inputs["old_log_probs"][:, 1:]
-            mask_sum = completion_mask.sum(-1).clamp(min=1.0)
-            per_sample_surprisal = -(old_log_probs * completion_mask).sum(-1) / mask_sum
-            per_sample_delight = advantages * per_sample_surprisal
-            batch_delight = per_sample_delight.mean()
-            batch_delight = self.accelerator.reduce(batch_delight.detach(), reduction="mean")
-            should_backward, prob, lam = self._kondo_gate.decide(batch_delight)
-            self._metrics["train"]["kondo_gate/backward_frac"].append(float(should_backward))
-            self._metrics["train"]["kondo_gate/prob"].append(prob)
-            if math.isfinite(lam):
-                self._metrics["train"]["kondo_gate/lambda"].append(lam)
-            if not should_backward:
-                return torch.zeros((), device=self.accelerator.device)
-        return super().training_step(model, inputs, num_items_in_batch)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"

@@ -691,7 +691,7 @@ training_args = AsyncGRPOConfig(
 
 The Kondo gate builds on the Delightful Policy Gradient: rather than weight every sample, it draws a per-sample Bernoulli on delight against an adaptive price \\( \lambda = \text{quantile}_{1-\rho}(\chi) \\), with probability \\( \sigma((\chi - \lambda) / \eta) \\). Gated-out samples skip the full forward and backward pass, tracing a quality–cost Pareto frontier. On MNIST at \\( \rho = 3\% \\), the gate nearly matches full DG while computing two orders of magnitude fewer backward passes.
 
-In the experimental asynchronous GRPO trainer, delight is screened using `old_log_probs` from the rollout as a proxy for the current-policy surprisal — §3.2 of the paper shows approximate delight is sufficient for screening. Decisions are synchronized across data-parallel ranks via an all-reduce on the batch delight and an identically-seeded Bernoulli generator.
+In the experimental asynchronous GRPO trainer, the gate runs at the rollout queue's dequeue point inside `RolloutQueueDataset`: as samples are pulled from the queue, their approximate delight (using the pre-computed `old_log_probs` as a proxy for current-policy surprisal — §3.2 of the paper shows this is sufficient for screening) is compared against an adaptive threshold and low-delight samples are dropped before they reach the trainer. Because `RolloutQueueDataset` runs on the main process only and Accelerate dispatches the filtered batch stream to every rank, no cross-rank synchronization is needed.
 
 ```python
 from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
