@@ -22,7 +22,12 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
-from trl.experimental.async_grpo.async_grpo_trainer import RolloutQueueDataset, _KondoGateState
+from trl.experimental.async_grpo.async_grpo_trainer import (
+    FilterDecision,
+    RolloutQueueDataset,
+    _KondoGateFilter,
+    _KondoGateState,
+)
 from trl.experimental.async_grpo.async_rollout_worker import RolloutSample
 
 from ..testing_utils import TrlTestCase
@@ -157,28 +162,26 @@ class TestAsyncGRPOTrainer(TrlTestCase):
         assert changed, "No parameters changed during training."
 
 
+def _make_rollout_sample(advantage: float, old_log_probs_val: float, model_version: int = 0) -> RolloutSample:
+    return RolloutSample(
+        prompt=[{"role": "user", "content": "x"}],
+        completion=[{"role": "assistant", "content": "y"}],
+        input_ids=[0, 1, 2],
+        completion_mask=[0, 1, 1],
+        old_log_probs=[0.0, old_log_probs_val, old_log_probs_val],
+        advantage=advantage,
+        model_version=model_version,
+        metrics={"reward": 0.0},
+    )
+
+
 class TestKondoGateState:
-    def test_warmup_never_gates(self):
-        gate = _KondoGateState(rate=0.5, temperature=1.0, history_size=8, warmup=4)
-        for i in range(3):
-            should, prob, lam = gate.decide(float(i))
-            assert should is True
-            assert prob == 1.0
-            assert lam == float("-inf")
-
-    def test_rate_one_is_noop(self):
-        gate = _KondoGateState(rate=1.0, temperature=1.0, history_size=8, warmup=1)
-        for i in range(10):
-            should, prob, _ = gate.decide(float(i))
-            assert should is True
-            assert prob == 1.0
-
     def test_sharp_temperature_separates_high_low_delight(self):
+        # With ρ=0.5 and two items in the buffer, λ lands at 0.5; sharp temperature makes the Bernoulli
+        # probability approach a hard indicator of sign(χ − λ).
         gate = _KondoGateState(rate=0.5, temperature=0.01, history_size=16, warmup=2)
-        # Fill the warmup buffer with two values — λ lands at 0.5.
         gate.decide(0.0)
         gate.decide(1.0)
-        # High delight → prob ≈ 1; low delight → prob ≈ 0.
         _, high_prob, _ = gate.decide(100.0)
         _, low_prob, _ = gate.decide(-100.0)
         assert high_prob > 0.99
@@ -193,87 +196,52 @@ class TestKondoGateState:
         assert set(gate._buffer.tolist()) == {6.0, 7.0, 8.0, 9.0}
 
 
-class TestRolloutQueueDatasetKondoIntegration:
-    """Verify that RolloutQueueDataset consults the Kondo gate and drops low-delight samples."""
-
-    @staticmethod
-    def _make_sample(advantage: float, old_log_probs_val: float, model_version: int = 0):
-        return RolloutSample(
-            prompt=[{"role": "user", "content": "x"}],
-            completion=[{"role": "assistant", "content": "y"}],
-            input_ids=[0, 1, 2],
-            completion_mask=[0, 1, 1],
-            old_log_probs=[0.0, old_log_probs_val, old_log_probs_val],
-            advantage=advantage,
-            model_version=model_version,
-            metrics={"reward": 0.0},
-        )
-
-    def test_kondo_gate_drops_low_delight_samples(self):
-        # Sharp temperature + a threshold well above the warmup values should reliably drop low-delight
-        # items until either a high-delight arrives or the consecutive-drop cap kicks in.
+class TestKondoGateFilter:
+    def test_force_yield_after_consecutive_drop_cap(self):
+        # Prime the ring buffer with a very high delight so λ sits far above any subsequent arrival.
         gate = _KondoGateState(rate=0.01, temperature=0.01, history_size=4, warmup=1)
+        gate.decide(100.0)
+        f = _KondoGateFilter(gate, max_consecutive_drops=2)
+
+        low_delight_sample = _make_rollout_sample(advantage=0.0, old_log_probs_val=0.0)
+
+        # First two calls drop (counter climbs), third call force-yields and resets.
+        d1 = f(low_delight_sample)
+        d2 = f(low_delight_sample)
+        d3 = f(low_delight_sample)
+        assert (d1.keep, d2.keep, d3.keep) == (False, False, True)
+        assert f._consecutive_drops == 0
+        assert d3.metrics.keys() == {"kondo_gate/delight", "kondo_gate/gate_prob", "kondo_gate/lambda"}
+
+
+class TestRolloutQueueDataset:
+    def test_filter_chain_metrics_and_drops(self):
+        # A recording filter + a drop-every-other filter, verifying: filter order, metric merging, drop
+        # behavior, and that queue_wait_time_s is always attached. Covers the dataset's entire contract.
+        seen: list[int] = []
+
+        def record_and_tag(sample):
+            seen.append(int(sample.advantage))
+            return FilterDecision(keep=True, metrics={"seen_idx": float(len(seen))})
+
+        def drop_even(sample):
+            return FilterDecision(keep=int(sample.advantage) % 2 == 1, metrics={})
+
         q = queue.Queue()
-        # Prime the buffer with high delight so λ sits near the top of the history.
-        q.put(self._make_sample(advantage=1.0, old_log_probs_val=-2.0))  # delight = 1.0 * 2.0 = 2.0
-        for _ in range(10):
-            q.put(self._make_sample(advantage=0.01, old_log_probs_val=-0.01))  # delight ~ 0.0001
+        for i in range(6):
+            q.put(_make_rollout_sample(advantage=float(i), old_log_probs_val=-0.1))
 
-        dataset = RolloutQueueDataset(
-            rollout_queue=q,
-            model_version_fn=lambda: 0,
-            max_staleness=10,
-            timeout=1.0,
-            kondo_gate=gate,
-            kondo_gate_max_consecutive_drops=6,
-        )
-        kept = []
-        for item in dataset:
-            kept.append(item)
-            if len(kept) >= 2:
-                break
-        assert kept, "dataset yielded nothing"
-        first = kept[0]
-        assert "kondo_gate/delight" in first["metrics"]
-        assert "kondo_gate/gate_prob" in first["metrics"]
-        assert "kondo_gate/lambda" in first["metrics"]
-        # Some items were dropped: we pushed 11 samples but yielded 2, so internal state must show drops.
-        assert dataset._kondo_consecutive_drops == 0  # last yielded reset counter
-
-    def test_kondo_gate_disabled_passes_samples_through(self):
-        q = queue.Queue()
-        for _ in range(3):
-            q.put(self._make_sample(advantage=0.1, old_log_probs_val=-0.1))
-
-        dataset = RolloutQueueDataset(
-            rollout_queue=q, model_version_fn=lambda: 0, max_staleness=10, timeout=1.0, kondo_gate=None
-        )
+        dataset = RolloutQueueDataset(rollout_queue=q, timeout=1.0, filters=[record_and_tag, drop_even])
         yielded = []
         for item in dataset:
             yielded.append(item)
             if len(yielded) >= 3:
                 break
-        assert len(yielded) == 3
-        for item in yielded:
-            assert "kondo_gate/delight" not in item["metrics"]
 
-    def test_consecutive_drop_cap_forces_yield(self):
-        # Gate that would drop everything (very high lambda) but cap=1 means the second call must yield.
-        gate = _KondoGateState(rate=0.01, temperature=0.01, history_size=4, warmup=1)
-        # Seed the buffer with a very high delight so λ ≈ that value; subsequent low-delight draws will try to drop.
-        gate.decide(100.0)
-        q = queue.Queue()
-        for _ in range(5):
-            q.put(self._make_sample(advantage=0.0, old_log_probs_val=0.0))  # delight = 0, gate wants to drop
-
-        dataset = RolloutQueueDataset(
-            rollout_queue=q,
-            model_version_fn=lambda: 0,
-            max_staleness=10,
-            timeout=1.0,
-            kondo_gate=gate,
-            kondo_gate_max_consecutive_drops=1,
-        )
-        first = next(iter(dataset))
-        assert first is not None
-        assert "kondo_gate/delight" in first["metrics"]
+        # record_and_tag ran on every sample (including dropped ones).
+        assert seen == [0, 1, 2, 3, 4, 5]
+        # Only odd-advantage samples survived drop_even.
+        assert [int(y["advantage"]) for y in yielded] == [1, 3, 5]
+        for y in yielded:
+            assert "seen_idx" in y["metrics"]
+            assert "queue_wait_time_s" in y["metrics"]

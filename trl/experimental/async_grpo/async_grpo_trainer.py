@@ -20,7 +20,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import torch
 from accelerate.logging import get_logger
@@ -77,12 +77,29 @@ class StepIntervalCallback(TrainerCallback):
             self.fn()
 
 
+class FilterDecision(NamedTuple):
+    """Output of a `SampleFilter`: whether to keep the sample, plus per-sample metrics to attach."""
+
+    keep: bool
+    metrics: dict[str, float] = {}
+
+
+class SampleFilter(Protocol):
+    """Predicate over a `RolloutSample`, run at queue dequeue. Stateful filters may maintain their own state.
+
+    Future hook shapes (`fn(sample) -> sample` transforms, `fn(list[sample]) -> list[sample]` windowed ops) can be
+    introduced alongside this protocol when concrete use cases arrive; today there are only predicates.
+    """
+
+    def __call__(self, sample) -> FilterDecision: ...
+
+
 class _KondoGateState:
     """Per-sample Kondo gate on delight (https://huggingface.co/papers/2603.20526).
 
     Maintains a ring buffer of past sample-level delight values, computes an adaptive threshold λ =
     quantile_{1−ρ}(history), and draws a Bernoulli gate with probability σ((χ − λ) / η). In the async_grpo pipeline
-    this is invoked from `RolloutQueueDataset` on the main process only — Accelerate dispatches the already-filtered
+    this is wrapped by `_KondoGateFilter` and run on the main process only — Accelerate dispatches the already-filtered
     batches to every rank, so no cross-rank synchronization is required.
     """
 
@@ -113,35 +130,68 @@ class _KondoGateState:
         return bool(gate.item()), float(prob.item()), float(lam.item())
 
 
-class RolloutQueueDataset(torch.utils.data.IterableDataset):
-    def __init__(
-        self,
-        rollout_queue,
-        model_version_fn,
-        max_staleness=3,
-        timeout=120.0,
-        kondo_gate: _KondoGateState | None = None,
-        kondo_gate_max_consecutive_drops: int = 128,
-    ):
-        self.queue = rollout_queue
-        self.model_version_fn = model_version_fn
-        self.max_staleness = max_staleness
-        self.timeout = timeout
-        self.kondo_gate = kondo_gate
-        self.kondo_gate_max_consecutive_drops = kondo_gate_max_consecutive_drops
-        self._kondo_consecutive_drops = 0
+def _approx_sample_delight(sample) -> float:
+    # Paper §3.2: approximate delight (using the pre-computed rollout `old_log_probs` as a proxy for
+    # current-policy surprisal) is sufficient for screening.
+    cm = sample.completion_mask
+    olp = sample.old_log_probs
+    total = sum(cm)
+    if total <= 0:
+        return 0.0
+    mean_surprisal = -sum(o * m for o, m in zip(olp, cm, strict=False)) / total
+    return float(sample.advantage) * float(mean_surprisal)
 
-    @staticmethod
-    def _approx_sample_delight(sample) -> float:
-        # Paper §3.2: approximate delight (using the pre-computed rollout `old_log_probs` as a proxy
-        # for current-policy surprisal) is sufficient for screening.
-        cm = sample.completion_mask
-        olp = sample.old_log_probs
-        total = sum(cm)
-        if total <= 0:
-            return 0.0
-        mean_surprisal = -sum(o * m for o, m in zip(olp, cm, strict=False)) / total
-        return float(sample.advantage) * float(mean_surprisal)
+
+def _make_staleness_filter(model_version_fn: Callable[[], int], max_staleness: int) -> SampleFilter:
+    """Drop samples whose rollout policy is more than `max_staleness` weight-updates behind the learner."""
+
+    def filter_(sample) -> FilterDecision:
+        staleness = model_version_fn() - sample.model_version
+        if staleness > max_staleness:
+            logger.info(f"dropping stale sample (staleness={staleness}, max={max_staleness})")
+            return FilterDecision(keep=False, metrics={})
+        return FilterDecision(keep=True, metrics={})
+
+    return filter_
+
+
+class _KondoGateFilter:
+    """SampleFilter wrapping `_KondoGateState`: drops low-delight samples with a force-yield safety cap.
+
+    The force-yield cap (`max_consecutive_drops`) prevents aggressive rates (small ρ) from starving the trainer when
+    the queue happens to be low-delight.
+    """
+
+    def __init__(self, gate: _KondoGateState, max_consecutive_drops: int = 128):
+        self.gate = gate
+        self.max_consecutive_drops = max_consecutive_drops
+        self._consecutive_drops = 0
+
+    def __call__(self, sample) -> FilterDecision:
+        delight = _approx_sample_delight(sample)
+        should_keep, prob, lam = self.gate.decide(delight)
+        if not should_keep and self._consecutive_drops < self.max_consecutive_drops:
+            self._consecutive_drops += 1
+            return FilterDecision(keep=False, metrics={})
+        self._consecutive_drops = 0
+        return FilterDecision(
+            keep=True,
+            metrics={
+                "kondo_gate/delight": delight,
+                "kondo_gate/gate_prob": prob,
+                # λ is -inf during warmup; use NaN so `log()` filters it out of aggregated metrics.
+                "kondo_gate/lambda": lam if math.isfinite(lam) else float("nan"),
+            },
+        )
+
+
+class RolloutQueueDataset(torch.utils.data.IterableDataset):
+    """Streams samples off the rollout queue, applies per-sample filters, and yields the survivors."""
+
+    def __init__(self, rollout_queue, timeout: float = 120.0, filters: list[SampleFilter] = ()):
+        self.queue = rollout_queue
+        self.timeout = timeout
+        self.filters = list(filters)
 
     def __iter__(self):
         while True:
@@ -158,33 +208,23 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
             if queue_wait_time_s > 1.0:
                 logger.info(f"waited {queue_wait_time_s:.1f}s for sample (qsize={self.queue.qsize()})")
 
-            staleness = self.model_version_fn() - sample.model_version
-            if staleness > self.max_staleness:
-                logger.info(f"dropping stale sample (staleness={staleness}, max={self.max_staleness})")
-                continue  # drop stale, pull next
-
-            kondo_metrics: dict[str, float] = {}
-            if self.kondo_gate is not None:
-                delight = self._approx_sample_delight(sample)
-                should_keep, prob, lam = self.kondo_gate.decide(delight)
-                if not should_keep and self._kondo_consecutive_drops < self.kondo_gate_max_consecutive_drops:
-                    # Drop low-delight samples; fall through after too many in a row to avoid starving the trainer.
-                    self._kondo_consecutive_drops += 1
-                    continue
-                self._kondo_consecutive_drops = 0
-                kondo_metrics = {
-                    "kondo_gate/delight": delight,
-                    "kondo_gate/gate_prob": prob,
-                    # λ is -inf during warmup; use NaN so `log()` filters it out of aggregated metrics.
-                    "kondo_gate/lambda": lam if math.isfinite(lam) else float("nan"),
-                }
+            extra_metrics: dict[str, float] = {}
+            keep = True
+            for f in self.filters:
+                decision = f(sample)
+                extra_metrics.update(decision.metrics)
+                if not decision.keep:
+                    keep = False
+                    break
+            if not keep:
+                continue
 
             yield {
                 "input_ids": sample.input_ids,
                 "completion_mask": sample.completion_mask,
                 "old_log_probs": sample.old_log_probs,
                 "advantage": sample.advantage,
-                "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s, **kondo_metrics},
+                "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s, **extra_metrics},
             }
 
 
@@ -486,12 +526,15 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
     def get_train_dataloader(self) -> DataLoader:
         if self.accelerator.is_main_process:
+            filters: list[SampleFilter] = [
+                _make_staleness_filter(lambda: self.model_version, self.args.max_staleness),
+            ]
+            if self._kondo_gate is not None:
+                filters.append(_KondoGateFilter(self._kondo_gate))
             dataset = RolloutQueueDataset(
                 rollout_queue=self.rollout_queue,
-                model_version_fn=lambda: self.model_version,
-                max_staleness=self.args.max_staleness,
                 timeout=self.args.vllm_server_timeout,
-                kondo_gate=self._kondo_gate,
+                filters=filters,
             )
         else:
             dataset = _EmptyIterableDataset()
