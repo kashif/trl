@@ -59,9 +59,13 @@ class AsyncGRPOConfig(_BaseConfig):
         epsilon_high (`float`, *optional*, defaults to `0.2`):
             Upper-bound epsilon value for clipping.
         use_delight (`bool`, *optional*, defaults to `False`):
-            Whether to gate per-token policy-gradient terms with the Delightful Policy Gradient sigmoid of
+            Whether to gate policy-gradient terms with the Delightful Policy Gradient sigmoid of
             delight = advantage × surprisal, as introduced in the [Delightful Policy Gradient
-            paper](https://huggingface.co/papers/2603.14608). Temperature η is fixed at 1.
+            paper](https://huggingface.co/papers/2603.14608). The gate is computed at the sample level
+            (one σ per response from the mean per-token delight, then broadcast across the response)
+            because GRPO's advantage is constant across a response, so per-token gating would zero out
+            the high-surprisal blunder tokens whose negative signal the learner needs.
+            Temperature η is fixed at 1.
         use_kondo_gate (`bool`, *optional*, defaults to `False`):
             Whether to enable the per-sample Kondo gate introduced in the [Does This Gradient Spark Joy?
             paper](https://huggingface.co/papers/2603.20526). When enabled, each training step draws a Bernoulli
@@ -72,7 +76,9 @@ class AsyncGRPOConfig(_BaseConfig):
             Target fraction ρ of training steps that receive a backward pass. `1.0` is a no-op even when the gate
             is enabled. Smaller values keep only the highest-delight samples.
         kondo_gate_temperature (`float`, *optional*, defaults to `1.0`):
-            Temperature η in the Kondo gate Bernoulli probability σ((χ − λ) / η).
+            Temperature η in the Kondo gate Bernoulli probability σ((χ − λ) / (σ_χ · η)), where σ_χ is the running
+            standard deviation of the delight buffer (batch-whitened delight, DG companion paper §2.1). Fixed at
+            `1` per the paper; whitening makes the gate scale-invariant, so ρ is achieved across the full range.
         kondo_gate_history_size (`int`, *optional*, defaults to `1024`):
             Size of the ring buffer of past sample delights used to compute the adaptive threshold
             λ = quantile_{1−ρ}.
@@ -180,9 +186,10 @@ class AsyncGRPOConfig(_BaseConfig):
     use_delight: bool = field(
         default=False,
         metadata={
-            "help": "Whether to gate per-token policy-gradient terms with the Delightful Policy Gradient sigmoid "
-            "of delight = advantage × surprisal (https://huggingface.co/papers/2603.14608). Temperature η is fixed "
-            "at 1."
+            "help": "Whether to gate policy-gradient terms with the Delightful Policy Gradient sigmoid of "
+            "delight = advantage × surprisal (https://huggingface.co/papers/2603.14608). The gate is computed at "
+            "the sample level (one σ per response from the mean per-token delight, broadcast across the response) "
+            "because GRPO's advantage is constant across a response. Temperature η is fixed at 1."
         },
     )
     use_kondo_gate: bool = field(
@@ -202,7 +209,11 @@ class AsyncGRPOConfig(_BaseConfig):
     )
     kondo_gate_temperature: float = field(
         default=1.0,
-        metadata={"help": "Temperature η in the Kondo gate Bernoulli probability σ((χ − λ) / η)."},
+        metadata={
+            "help": "Temperature η in the Kondo gate Bernoulli probability σ((χ − λ) / (σ_χ · η)), with σ_χ the "
+            "running stdev of the delight buffer (batch-whitened delight, DG companion paper §2.1). Fixed at 1 "
+            "per the paper."
+        },
     )
     kondo_gate_history_size: int = field(
         default=1024,

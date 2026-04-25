@@ -672,7 +672,9 @@ The official code [sail-sg/Stable-RL](https://github.com/sail-sg/Stable-RL)
 
 **📜 Paper**: https://huggingface.co/papers/2603.14608
 
-The Delightful Policy Gradient (DG) gates each per-token policy-gradient term by a sigmoid of *delight*, the product of advantage and action surprisal \\( \chi = U \cdot \ell \\) where \\( \ell = -\log \pi_\theta(a) \\). The gate amplifies rare successes ("breakthroughs") and suppresses rare failures ("blunders"), shifting the expected gradient closer to a supervised cross-entropy oracle — an effect that persists even in the infinite-sample limit. The temperature \\( \eta \\) is fixed at 1 per the paper.
+The Delightful Policy Gradient (DG) gates each policy-gradient term by a sigmoid of *delight*, the product of advantage and action surprisal \\( \chi = U \cdot \ell \\) where \\( \ell = -\log \pi_\theta(a) \\). The gate amplifies rare successes ("breakthroughs") and suppresses rare failures ("blunders"), shifting the expected gradient closer to a supervised cross-entropy oracle — an effect that persists even in the infinite-sample limit. The temperature \\( \eta \\) is fixed at 1 per the paper.
+
+In the experimental asynchronous GRPO trainer, the gate is computed at the **sample level**: one σ per response from the mean per-token delight \\( \bar\chi = U \cdot \overline{\ell} \\), broadcast across the response. GRPO's advantage is constant across a response, so a per-token gate would zero out exactly the high-surprisal blunder tokens whose negative signal the learner needs.
 
 This is available in the experimental asynchronous GRPO trainer:
 
@@ -689,7 +691,7 @@ training_args = AsyncGRPOConfig(
 
 **📜 Paper**: https://huggingface.co/papers/2603.20526
 
-The Kondo gate builds on the Delightful Policy Gradient: rather than weight every sample, it draws a per-sample Bernoulli on delight against an adaptive price \\( \lambda = \text{quantile}_{1-\rho}(\chi) \\), with probability \\( \sigma((\chi - \lambda) / \eta) \\). Gated-out samples skip the full forward and backward pass, tracing a quality–cost Pareto frontier. On MNIST at \\( \rho = 3\% \\), the gate nearly matches full DG while computing two orders of magnitude fewer backward passes.
+The Kondo gate builds on the Delightful Policy Gradient: rather than weight every sample, it draws a per-sample Bernoulli on delight against an adaptive price \\( \lambda = \text{quantile}_{1-\rho}(\chi) \\), with probability \\( \sigma((\chi - \lambda) / (\sigma_\chi \cdot \eta)) \\) where \\( \sigma_\chi \\) is the running standard deviation of the delight buffer (batch-whitened delight, DG companion paper §2.1, applied here so the gate is scale-invariant: \\( \rho \\) is achieved across the full range, not just \\( \rho \geq 0.5 \\)). Gated-out samples skip the full forward and backward pass, tracing a quality–cost Pareto frontier. On MNIST at \\( \rho = 3\% \\), the gate nearly matches full DG while computing two orders of magnitude fewer backward passes.
 
 In the experimental asynchronous GRPO trainer, the gate runs at the rollout queue's dequeue point inside `RolloutQueueDataset`: as samples are pulled from the queue, their approximate delight (using the pre-computed `old_log_probs` as a proxy for current-policy surprisal — §3.2 of the paper shows this is sufficient for screening) is compared against an adaptive threshold and low-delight samples are dropped before they reach the trainer. Because `RolloutQueueDataset` runs on the main process only and Accelerate dispatches the filtered batch stream to every rank, no cross-rank synchronization is needed.
 
@@ -700,7 +702,7 @@ training_args = AsyncGRPOConfig(
     use_delight=True,  # recommended; delight also drives the gate
     use_kondo_gate=True,
     kondo_gate_rate=0.1,  # ρ: target fraction of steps with a backward pass
-    kondo_gate_temperature=1.0,  # η
+    kondo_gate_temperature=1.0,  # η, fixed at 1 per the paper
     ...,
 )
 ```

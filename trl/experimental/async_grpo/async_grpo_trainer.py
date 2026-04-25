@@ -118,14 +118,22 @@ class _KondoGateState:
         self._count = min(self._count + 1, self._history_size)
 
     def decide(self, sample_delight: float) -> tuple[bool, float, float]:
-        """Returns (should_keep, gate_prob, lambda)."""
+        """Returns (should_keep, gate_prob, lambda).
+
+        Applies the DG companion paper's batch-whitened delight (§2.1) by scaling the sigmoid denominator with the
+        buffer's running standard deviation. With η=1 this makes the gate scale-invariant: a small-magnitude delight
+        distribution (e.g. sample-level GRPO) yields the same effective gate behavior as the paper's unit-scale
+        per-token discrete actions, so the configured ρ is achieved across the full range, not just ρ ≥ 0.5.
+        """
         chi = torch.tensor(float(sample_delight))
         self._append(chi)
         if self._count < self.warmup or self.rate >= 1.0:
             return True, 1.0, float("-inf")
         history = self._buffer[: self._count]
         lam = torch.quantile(history, 1.0 - self.rate)
-        prob = torch.sigmoid((chi - lam) / self.temperature)
+        # std() needs ≥2 samples; with one, skip whitening and fall back to η alone.
+        sigma = history.std().clamp(min=1e-8) if self._count >= 2 else torch.tensor(1.0)
+        prob = torch.sigmoid((chi - lam) / (sigma * self.temperature))
         gate = torch.bernoulli(prob)
         return bool(gate.item()), float(prob.item()), float(lam.item())
 
@@ -599,7 +607,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
         advantages = advantages.unsqueeze(1)
         if self.args.use_delight:
             # Delightful Policy Gradient gate (https://huggingface.co/papers/2603.14608); η=1 per the paper.
-            advantages = advantages * torch.sigmoid(-advantages * log_probs.detach())
+            # GRPO's advantage is constant across a response, so a per-token gate would zero out the
+            # high-surprisal "blunder" tokens whose negative signal we need to learn from. We instead form
+            # one gate per response from the mean per-token delight and broadcast it across the response.
+            surprisal = -log_probs.detach()
+            mean_surprisal = (surprisal * completion_mask).sum(dim=-1, keepdim=True) / completion_mask.sum(
+                dim=-1, keepdim=True
+            ).clamp(min=1)
+            advantages = advantages * torch.sigmoid(advantages * mean_surprisal)
         log_ratio = log_probs - old_log_probs
         ratio = torch.exp(log_ratio)
         clipped = torch.clamp(ratio, 1 - self.epsilon_low, 1 + self.epsilon_high)
