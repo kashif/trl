@@ -759,9 +759,7 @@ class GOLDTrainer(SFTTrainer):
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = (args.model_init_kwargs or {}).get("revision")
-        if train_dataset is None:
-            raise ValueError("`train_dataset` is required")
-        dataset_sample = next(iter(train_dataset))
+        dataset_sample = next(iter(train_dataset)) if train_dataset is not None else {}
         if processing_class is None:
             processing_class = AutoProcessor.from_pretrained(get_config_model_id(model.config))
             # simplified logic from SFTTrainer
@@ -769,12 +767,11 @@ class GOLDTrainer(SFTTrainer):
         if isinstance(processing_class, ProcessorMixin):
             tokenizer = processing_class.tokenizer
             self._is_vlm = True
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
         else:
             tokenizer = processing_class
             self._is_vlm = False
-
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
 
         self.pad_token_id = tokenizer.pad_token_id
 
@@ -972,7 +969,7 @@ class GOLDTrainer(SFTTrainer):
             "top_p": args.top_p,
             "do_sample": True,
             "top_k": args.top_k,
-            "pad_token_id": self.processing_class.pad_token_id,
+            "pad_token_id": self.pad_token_id,
         }
         self.generation_config = GenerationConfig(**generation_kwargs)
         # Keep training-specific generation kwargs to overwrite model's original generation config
@@ -1438,9 +1435,7 @@ class GOLDTrainer(SFTTrainer):
         updated_slice["byte_offsets"] = torch.tensor(rows, dtype=torch.long, device=new_input_ids.device)
 
     @profiling_decorator
-    def _fill_buffer(
-        self, generation_batch: dict[str, torch.Tensor | Any] | list[dict], buffer_steps: int
-    ):
+    def _fill_buffer(self, generation_batch: dict[str, torch.Tensor | Any] | list[dict], buffer_steps: int):
         if self._vlm_collator is not None:
             # Identity collator path: generation_batch is list[dict] with raw PIL images.
             # Split into chunks via list slicing, then collate on-the-fly per slice.
@@ -2313,8 +2308,8 @@ class GOLDTrainer(SFTTrainer):
 
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             student_labels = inputs["labels"].clone()
-            if self.processing_class.pad_token_id is not None:
-                student_labels[student_labels == self.processing_class.pad_token_id] = -100
+            if self.pad_token_id is not None:
+                student_labels[student_labels == self.pad_token_id] = -100
             if self.teacher_tokenizer.pad_token_id is not None:
                 teacher_labels[teacher_labels == self.teacher_tokenizer.pad_token_id] = -100
 
@@ -2378,7 +2373,7 @@ class GOLDTrainer(SFTTrainer):
         device = generated_tokens.device
 
         prompt_mask = inputs.get("prompt_attention_mask")
-        pad_token_id = pad_token_id if pad_token_id is not None else self.pad_token_id
+        pad_token_id = pad_token_id if pad_token_id is not None else self.processing_class.pad_token_id
 
         # model.generate() returns full sequences (prompt + completion), so completions start
         # after the full padded prompt width.

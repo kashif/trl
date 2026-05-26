@@ -573,6 +573,26 @@ class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
         labels[attention_mask == 0] = -100
         labels[completion_mask == 0] = -100
 
+        # Completion-relative byte offsets for cross-tokenizer ULD. Computed from the final input_ids/labels
+        # via per-token piece byte length (the same primitive the on-policy / teacher path uses), so it is
+        # layout-agnostic after flush_left/truncation and shares the teacher's byte coordinate system.
+        tokenizer = self.processor.tokenizer
+        piece_len_cache: dict[int, int] = {}
+        byte_offset_rows: list[list[tuple[int, int]]] = []
+        for row_ids, row_labels in zip(input_ids.tolist(), labels.tolist(), strict=True):
+            offs: list[tuple[int, int]] = [(0, 0)] * len(row_ids)
+            cumulative = 0
+            for pos, (tid, label) in enumerate(zip(row_ids, row_labels, strict=True)):
+                if label == -100:
+                    continue
+                if tid not in piece_len_cache:
+                    piece_len_cache[tid] = piece_byte_len(tokenizer.convert_ids_to_tokens([tid])[0])
+                nb = piece_len_cache[tid]
+                offs[pos] = (cumulative, cumulative + nb)
+                cumulative += nb
+            byte_offset_rows.append(offs)
+        byte_offsets = torch.tensor(byte_offset_rows, dtype=torch.long)
+
         # Build output with non-sequence vision keys from processed_prompts (pixel_values, image_grid_thw, etc.).
         output = {
             k: v
@@ -582,6 +602,7 @@ class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
         output["input_ids"] = input_ids
         output["attention_mask"] = attention_mask
         output["labels"] = labels
+        output["byte_offsets"] = byte_offsets
         if "token_type_ids" in processed_prompts:
             output["token_type_ids"] = token_type_ids
         if (
