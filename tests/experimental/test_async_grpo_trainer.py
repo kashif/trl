@@ -178,9 +178,7 @@ class _SuffixStub:
 @require_renderers
 class TestAsyncRolloutWorkerRenderer(TrlTestCase):
     """The worker now bridges tool turns with a per-family renderer. These cover the silent failures of
-    the apply_chat_template dummy-diff path that motivated the switch — adapted from
-    https://gist.github.com/mikasenghaas/e336d15761cf49af5e4eb662356a5d78 and
-    https://gist.github.com/mikasenghaas/4d470f0537f5fc8d3c8117ea80d6e01a.
+    the apply_chat_template dummy-diff path that motivated the switch.
     """
 
     def test_glm_observation_token_not_doubled(self):
