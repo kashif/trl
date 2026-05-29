@@ -16,14 +16,19 @@ import itertools
 import queue
 
 import numpy as np
+import pytest
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
+from transformers.utils import is_renderers_available
 
 from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
 from trl.experimental.async_grpo.async_rollout_worker import RolloutSample
 
-from ..testing_utils import TrlTestCase
+from ..testing_utils import TrlTestCase, require_vllm
+
+
+require_renderers = pytest.mark.skipif(not is_renderers_available(), reason="test requires renderers")
 
 
 def dummy_reward_func(completions, **kwargs):
@@ -137,3 +142,84 @@ class TestAsyncGRPOTrainer(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+
+CALC_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "calc",
+        "description": "Compute an arithmetic expression.",
+        "parameters": {
+            "type": "object",
+            "properties": {"expr": {"type": "string"}},
+            "required": ["expr"],
+        },
+    },
+}
+ASSISTANT_TOOL_CALL = {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [{"type": "function", "function": {"name": "calc", "arguments": {"expr": "2+2"}}}],
+}
+TOOL_MESSAGE = {"role": "tool", "name": "calc", "content": "4"}
+
+
+class _SuffixStub:
+    """Carries only the attributes ``AsyncRolloutWorker._get_tool_suffix_ids`` reads, so the real
+    (apply_chat_template dummy-diff) method can be exercised without standing up a vLLM server."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.chat_template = None
+        self.chat_template_kwargs = {}
+
+
+@require_vllm
+@require_renderers
+class TestAsyncRolloutWorkerRenderer(TrlTestCase):
+    """The worker now bridges tool turns with a per-family renderer. These cover the silent failures of
+    the apply_chat_template dummy-diff path that motivated the switch — adapted from
+    https://gist.github.com/mikasenghaas/e336d15761cf49af5e4eb662356a5d78 and
+    https://gist.github.com/mikasenghaas/4d470f0537f5fc8d3c8117ea80d6e01a.
+    """
+
+    def test_glm_observation_token_not_doubled(self):
+        # GLM has no end-of-turn token; the inference engine stops on the next turn's <|observation|>.
+        # The dummy-diff suffix *also* starts with <|observation|>, so naive stitching doubles it. The
+        # renderer's bridge extends the engine-stopped stream verbatim and emits exactly one.
+        from trl.experimental.async_grpo.async_rollout_worker import AsyncRolloutWorker
+
+        tokenizer = AutoTokenizer.from_pretrained("zai-org/GLM-4.5", trust_remote_code=True)
+        renderer = tokenizer.get_renderer("glm-4.5")
+        observation_id = tokenizer.convert_tokens_to_ids("<|observation|>")
+
+        prompt = [{"role": "user", "content": "What's 2+2?"}]
+        prompt_ids = renderer.render_ids(prompt, tools=[CALC_TOOL], add_generation_prompt=True)
+        full = renderer.render_ids(prompt + [ASSISTANT_TOOL_CALL], tools=[CALC_TOOL])
+        # Simulate the engine stopping on <|observation|> at the end of the sampled tool-call turn.
+        turn_ids = list(full[len(prompt_ids) :]) + [observation_id]
+
+        bridged = renderer.bridge_to_next_turn(
+            previous_prompt_ids=prompt_ids,
+            previous_completion_ids=turn_ids,
+            new_messages=[TOOL_MESSAGE],
+            tools=[CALC_TOOL],
+        )
+        # This is exactly how the worker assembles the next prompt.
+        suffix_ids = list(bridged.token_ids)[len(prompt_ids) + len(turn_ids) :]
+        sequence = prompt_ids + turn_ids + suffix_ids
+        assert sequence.count(observation_id) == 1, "renderer bridge must not duplicate <|observation|>"
+
+        # The fallback dummy-diff suffix begins with <|observation|>, which would double it against the
+        # engine-stopped turn — the silent corruption the renderer path avoids.
+        dummy_suffix = AsyncRolloutWorker._get_tool_suffix_ids(_SuffixStub(tokenizer), [TOOL_MESSAGE])
+        assert dummy_suffix[0] == observation_id
+
+    def test_minimax_bare_tool_message_not_tokenizable_but_renderer_resolves(self):
+        # Building a tool bridge by tokenizing a bare tool message — an optimization one might reach for —
+        # does not generalize: MiniMax's template raises on a lone tool message. The worker sidesteps this
+        # by resolving a per-family renderer, which bridges without that assumption.
+        tokenizer = AutoTokenizer.from_pretrained("MiniMaxAI/MiniMax-M2", trust_remote_code=True)
+        with pytest.raises(Exception):
+            tokenizer.apply_chat_template([TOOL_MESSAGE], add_generation_prompt=True, tokenize=True, return_dict=False)
+        assert type(tokenizer.get_renderer(strict=True)).__name__ == "MiniMaxM2Renderer"
