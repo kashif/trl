@@ -178,7 +178,16 @@ class AsyncRolloutWorker:
         if self.tools:
             try:
                 self._renderer = self.tokenizer.get_renderer(strict=True)
-            except ValueError:
+            except ValueError as exc:
+                # No per-family renderer for this model. Don't drop to the chat-template path silently:
+                # it cannot guarantee a safe multi-turn bridge and can corrupt tokens for some templates
+                # (e.g. GLM doubling `<|observation|>` at the tool boundary). Warn, then fall back.
+                logger.warning(
+                    "No per-family renderer for multi-turn tool rollouts (%s). Falling back to chat-template "
+                    "stitching, which is not guaranteed safe for every template. Install `renderers` or declare a "
+                    "renderer for this model to use the Token-In Token-Out path.",
+                    exc,
+                )
                 self._renderer = None
         # In multi-turn training, the chat template *must* be prefix-preserving. If the tokenizer's original template
         # isn't, we replace it at initialization with a training-safe, prefix-preserving template. A renderer makes
