@@ -168,9 +168,24 @@ class AsyncRolloutWorker:
         self.num_completions_to_print = num_completions_to_print
         self.tokenizer = processing_class
         self.tokenizer = add_response_schema(self.tokenizer)
+        # Prefer a per-family renderer (Token-In, Token-Out) for multi-turn tool rollouts: it extends the
+        # sampled stream across turns verbatim and parses completions per-family, so we neither patch the
+        # deployed chat template nor hand-trim the end-of-turn boundary (the cases a generic
+        # apply_chat_template delta gets wrong silently — GLM's `<|observation|>`, no end-of-turn token,
+        # position-dependent templates). `strict=True` declines the generic fallback, so we cleanly fall
+        # back to the prefix-preserving-template path below when no renderer exists for the model.
+        self._renderer = None
+        if self.tools:
+            try:
+                self._renderer = self.tokenizer.get_renderer(strict=True)
+            except ValueError:
+                self._renderer = None
         # In multi-turn training, the chat template *must* be prefix-preserving. If the tokenizer's original template
-        # isn't, we replace it at initialization with a training-safe, prefix-preserving template.
-        if self.tools and not is_chat_template_prefix_preserving(self.tokenizer):
+        # isn't, we replace it at initialization with a training-safe, prefix-preserving template. A renderer makes
+        # this unnecessary — it owns the messages-to-tokens boundary without forking the deployed template.
+        if self._renderer is not None:
+            self.chat_template = None
+        elif self.tools and not is_chat_template_prefix_preserving(self.tokenizer):
             self.chat_template = get_training_chat_template(self.tokenizer)
         else:
             self.chat_template = None
@@ -555,14 +570,17 @@ class AsyncRolloutWorker:
         tool_failure_count = 0
         iteration_num = 0
         max_iterations = self.max_tool_calling_iterations
-        prompt_ids = self.tokenizer.apply_chat_template(
-            prompt,
-            return_dict=False,
-            add_generation_prompt=True,
-            tools=self.tools or None,  # `or None`: Llama bug: it renders tool boilerplate for tools=[]
-            chat_template=self.chat_template,
-            **self.chat_template_kwargs,
-        )
+        if self._renderer is not None:
+            prompt_ids = self._renderer.render_ids(prompt, tools=self.tools or None, add_generation_prompt=True)
+        else:
+            prompt_ids = self.tokenizer.apply_chat_template(
+                prompt,
+                return_dict=False,
+                add_generation_prompt=True,
+                tools=self.tools or None,  # `or None`: Llama bug: it renders tool boilerplate for tools=[]
+                chat_template=self.chat_template,
+                **self.chat_template_kwargs,
+            )
         while True:
             turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
             assistant_message = parse_response(self.tokenizer, turn_ids)
@@ -578,7 +596,18 @@ class AsyncRolloutWorker:
             tool_call_count += n_calls
             tool_failure_count += n_failures
             completion.extend(tool_messages)
-            suffix_ids = self._get_tool_suffix_ids(tool_messages)
+            if self._renderer is not None:
+                # bridge_to_next_turn extends prompt_ids + turn_ids verbatim and appends the tool turn;
+                # the suffix is the part past the sampled turn. No dummy-diff, no end-of-turn trim.
+                bridged = self._renderer.bridge_to_next_turn(
+                    previous_prompt_ids=prompt_ids,
+                    previous_completion_ids=turn_ids,
+                    new_messages=tool_messages,
+                    tools=self.tools or None,
+                )
+                suffix_ids = list(bridged.token_ids)[len(prompt_ids) + len(turn_ids) :]
+            else:
+                suffix_ids = self._get_tool_suffix_ids(tool_messages)
             completion_ids.extend(suffix_ids)
             completion_logprobs.extend([0.0] * len(suffix_ids))
             tool_mask.extend([0] * len(suffix_ids))
