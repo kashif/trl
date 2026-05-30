@@ -2538,6 +2538,9 @@ def test_on_policy_vlm_without_vllm_collates_only_consumed_slice(monkeypatch):
     trainer.generation_kwargs = {}
     trainer.generation_config = SimpleNamespace()
     trainer.pad_token_id = 0
+    trainer.use_uld_loss = False
+    trainer.teacher_tokenizer = None
+    trainer.uld_loss_fn = None
     collated_per_call = []
 
     class StubProcessor:
