@@ -147,18 +147,17 @@ def pad_byte_offsets(offsets: list[tuple[int, int]], target_length: int, padding
     return torch.cat([pad_block, offs], dim=0) if padding_side == "left" else torch.cat([offs, pad_block], dim=0)
 
 
-def piece_byte_len(piece: str) -> int:
-    """UTF-8 byte length of a single token's piece string.
+def is_byte_level_tokenizer(backend) -> bool:
+    """Whether ``backend`` is a ByteLevel BPE tokenizer (Llama-3 family, SmolLM, Qwen, \u2026) \u2014 its pieces are in
+    byte\u2192unicode space, one char per source byte. Detected via the pre-tokenizer / decoder repr."""
+    return "ByteLevel" in repr(backend.pre_tokenizer) or "ByteLevel" in repr(backend.decoder)
 
-    Works for ByteLevel BPE (each piece char maps to one source byte), SentencePiece byte-fallback (``<0xXX>``
-    represents one byte), and the bare SentencePiece word-start marker ``\u2581``. Used both to disambiguate
-    overlapping char-derived spans (off-policy) and to derive completion-relative offsets directly from generated token
-    ids (on-policy), so both sides share one byte coordinate system without any decode-then-re-encode round-trip.
-    """
-    if piece == "\u2581":
-        return 0
-    if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
-        return 1
+
+def piece_byte_len(piece: str) -> int:
+    """UTF-8 byte length of a ByteLevel BPE token piece \u2014 each char maps 1:1 to one source byte.
+
+    Cross-tokenizer ULD targets ByteLevel BPE pairs (Llama-3, Qwen, SmolLM, Phi, Mistral v0.3+, \u2026); SentencePiece
+    students are out of scope here and would need the loss-level projection from X-Token to align."""
     return len(piece)
 
 
@@ -251,6 +250,11 @@ def encode_with_byte_offsets(backend, texts: list[str], add_special_tokens: bool
 
     Byte offsets are derived from the fast tokenizer's character offsets via an O(N) char-to-byte cumulative table.
     Overlapping spans from byte-level and byte-fallback tokens are split across their byte pieces."""
+    if not is_byte_level_tokenizer(backend):
+        raise NotImplementedError(
+            "Cross-tokenizer ULD currently supports only ByteLevel BPE tokenizers "
+            "(Llama-3, Qwen, SmolLM, Phi, Mistral v0.3+, …). The given tokenizer is not ByteLevel."
+        )
     encs = backend.encode_batch(texts, add_special_tokens=add_special_tokens)
     out = []
     for text, enc in zip(texts, encs, strict=True):
@@ -303,14 +307,27 @@ class DataCollatorForChatML:
                 formatted_message = self.tokenizer.apply_chat_template(
                     message, add_generation_prompt=False, tokenize=False
                 )
-                [(message_input_ids_full, full_offs)] = encode_with_byte_offsets(
-                    self.tokenizer.backend_tokenizer, [formatted_message], add_special_tokens=False
-                )
-                prompt_byte_len = len(formatted_prompt.encode("utf-8"))
-                completion_start_idx_full = next(
-                    (idx for idx, (start, _) in enumerate(full_offs) if start >= prompt_byte_len),
-                    len(message_input_ids_full),
-                )
+                if is_byte_level_tokenizer(self.tokenizer.backend_tokenizer):
+                    [(message_input_ids_full, full_offs)] = encode_with_byte_offsets(
+                        self.tokenizer.backend_tokenizer, [formatted_message], add_special_tokens=False
+                    )
+                    prompt_byte_len = len(formatted_prompt.encode("utf-8"))
+                    completion_start_idx_full = next(
+                        (idx for idx, (start, _) in enumerate(full_offs) if start >= prompt_byte_len),
+                        len(message_input_ids_full),
+                    )
+                else:
+                    # Non-ByteLevel tokenizer: byte offsets are unnecessary (cross-tokenizer ULD requires ByteLevel
+                    # anyway). Fall back to plain tokenization so GKD / non-ULD trainers with SentencePiece or
+                    # Unigram tokenizers still work through this collator.
+                    message_input_ids_full = self.tokenizer(
+                        formatted_message, add_special_tokens=False, return_tensors=None
+                    )["input_ids"]
+                    completion_start_idx_full = len(
+                        self.tokenizer(formatted_prompt, add_special_tokens=False, return_tensors=None)["input_ids"]
+                    )
+                    full_offs = [(0, 0)] * len(message_input_ids_full)
+                    prompt_byte_len = 0
 
                 # Keep the last max_length tokens — drops oldest prompt context first,
                 # never drops from the END (the model's recent context).
@@ -341,14 +358,12 @@ class DataCollatorForChatML:
                 attention_mask.append(example.get("attention_mask", [1] * len(sample_ids)))
                 completion_mask = example.get("completion_mask")
                 if completion_mask is not None:
-                    # Boundary tracked at tokenize time: the prompt is the leading non-completion tokens
-                    # of the sequence itself — no re-tokenization, so it stays correct after the sequence
-                    # was truncated keeping the completion end.
+                    # Use the tracked boundary directly: no re-tokenization, survives truncation.
                     prompt_len = completion_mask.index(1) if 1 in completion_mask else len(sample_ids)
                     current_prompt_ids = sample_ids[:prompt_len]
                 else:
-                    # No tracked boundary: recover the prompt by tokenizing its text. Avoid `truncation=True`
-                    # here: it persists on the backend used by `encode_with_byte_offsets`.
+                    # No tracked boundary: tokenize the prompt and cap with a slice (avoid `truncation=True`,
+                    # which would persist on the shared backend used by `encode_with_byte_offsets`).
                     tokenized_prompt = self.tokenizer(
                         formatted_prompt,
                         padding=False,

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -254,7 +255,7 @@ def build_config(**overrides):
 
 @pytest.fixture(scope="session")
 def llama_tokenizer():
-    tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-LlamaForCausalLM-3.2")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
@@ -333,30 +334,6 @@ def encode_prompt_completion(tokenizer, prompt, completion):
     return input_ids, labels, byte_offsets
 
 
-def test_chatml_collator_uses_original_prompt_text_for_tokenized_rows(llama_tokenizer):
-    collator = DataCollatorForChatML(tokenizer=llama_tokenizer, max_length=64)
-    prompt = "Question:"
-    completion = " hello"
-    input_ids, labels, byte_offsets = encode_prompt_completion(llama_tokenizer, prompt, completion)
-
-    batch = collator(
-        [
-            {
-                "input_ids": input_ids,
-                "attention_mask": [1] * len(input_ids),
-                "original_prompt_text": prompt,
-                "byte_offsets": byte_offsets,
-            }
-        ]
-    )
-
-    assert torch.equal(batch["labels"][0, -len(labels) :], torch.tensor(labels, dtype=torch.long))
-    [(long_ids, _)] = encode_with_byte_offsets(
-        llama_tokenizer.backend_tokenizer, [" ".join(["token"] * (len(input_ids) + 1))], add_special_tokens=False
-    )
-    assert len(long_ids) > len(input_ids)
-
-
 def pad_tokens(ids, pad_id, target_length):
     return ids + [pad_id] * (target_length - len(ids))
 
@@ -382,6 +359,7 @@ def test_process_completions_to_buffer_left_pads_prompt_ids():
     trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
     trainer.processing_class = RecordingTokenizer()
     trainer.args = SimpleNamespace(max_length=None)
+    trainer.use_uld_loss = False
     trainer._buffered_inputs = [None]
     trainer._buffered_text_logs = [None]
 
@@ -532,6 +510,7 @@ def test_generate_on_policy_for_slices_reconstructs_prompt_with_special_tokens()
     trainer.processing_class = RecordingTokenizer()
     trainer.args = SimpleNamespace(max_length=None, report_to=[])
     trainer.use_vllm = True
+    trainer.use_uld_loss = False
     trainer.vllm_generation = RecordingVLLMGeneration()
     trainer.vllm_sync_frequency = 1
     trainer._last_vllm_sync_step = -1
@@ -797,6 +776,13 @@ def test_prepared_tokenized_rows_keep_completion_after_truncation(llama_tokenize
     assert len(row["input_ids"]) == max_length  # truncated, not dropped
     assert 1 in row["completion_mask"]  # completion survived front-truncation
 
+    # original_prompt_text / original_completion_text must reflect the truncated ids the student kept,
+    # not the pre-truncation strings (otherwise the teacher would re-encode a longer prompt context).
+    completion_start = row["completion_mask"].index(1)
+    decode = partial(llama_tokenizer.decode, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    assert row["original_prompt_text"] == decode(row["input_ids"][:completion_start])
+    assert row["original_completion_text"] == decode(row["input_ids"][completion_start:])
+
     collator = DataCollatorForChatML(tokenizer=llama_tokenizer, max_length=max_length)
     batch = collator([row])
 
@@ -805,6 +791,36 @@ def test_prepared_tokenized_rows_keep_completion_after_truncation(llama_tokenize
     supervised = [label for label in batch["labels"][0].tolist() if label != -100]
     assert supervised == completion_ids
     assert assistant in llama_tokenizer.decode(completion_ids)
+
+
+def test_prepared_tokenized_rows_rebase_byte_offsets_when_truncation_eats_into_completion(llama_tokenizer):
+    """When truncation drops the front of the completion (``drop > completion_start``), the kept byte_offsets
+    reference bytes in the original completion text — but ``original_completion_text`` is decoded fresh from the kept
+    ids and starts at byte 0. The kept offsets must be rebased so they match the teacher's re-encoding."""
+    short_prompt = "Q:"
+    long_completion = "word " * 300  # completion alone overflows max_length
+    dataset = Dataset.from_dict({"prompt": [short_prompt], "completion": [long_completion]})
+
+    max_length = 32
+    args = SimpleNamespace(
+        dataset_num_proc=None,
+        dataset_text_field="text",
+        max_length=max_length,
+        packing_strategy="bfd",
+        use_liger_kernel=False,
+    )
+    trainer = GOLDTrainer.__new__(GOLDTrainer)
+    prepared = trainer._prepare_dataset_with_original_text(
+        dataset, llama_tokenizer, args, packing=False, formatting_func=None, dataset_name="train"
+    )
+    row = prepared[0]
+
+    assert len(row["input_ids"]) == max_length
+    # Prompt is so short that truncation ate into the completion: no prompt tokens survive.
+    assert row["completion_mask"] == [1] * max_length
+
+    # First kept completion token must start at byte 0 of the new (truncated) original_completion_text.
+    assert tuple(row["byte_offsets"][0]) == (0, len(b"word "))
 
 
 def test_prepare_dataset_messages_uses_last_assistant_turn(qwen_tokenizer):
@@ -1024,8 +1040,13 @@ def test_generate_on_policy_outputs_masks_prompt(llama_tokenizer):
     assert torch.all(new_labels[0, :padded_prompt_len] == -100)
     assert torch.equal(new_labels[0, padded_prompt_len:], torch.tensor(completion_ids, dtype=torch.long))
 
-    assert prompt_texts[0] == llama_tokenizer.decode(prompt_ids, skip_special_tokens=False)
-    assert completion_texts[0] == llama_tokenizer.decode(completion_ids, skip_special_tokens=False)
+    unpadded_prompt_ids = prompt_tensor[0][prompt_mask[0].bool()].tolist()
+    assert prompt_texts[0] == llama_tokenizer.decode(
+        unpadded_prompt_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+    )
+    assert completion_texts[0] == llama_tokenizer.decode(
+        completion_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+    )
 
 
 @pytest.mark.slow
