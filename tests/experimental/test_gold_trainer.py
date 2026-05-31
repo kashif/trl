@@ -893,6 +893,7 @@ def test_on_policy_completion_byte_offsets_match_encode_offsets(smollm_tokenizer
     trainer.teacher_tokenizer = qwen_tokenizer
     trainer.uld_loss_fn = SimpleNamespace(use_extended_uld=True)
     trainer.processing_class = smollm_tokenizer
+    trainer._is_vlm = False
 
     completion_text = "hello 你好 😊"
     [(completion_ids, expected_offsets)] = encode_with_byte_offsets(

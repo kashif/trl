@@ -1420,6 +1420,9 @@ class GOLDTrainer(SFTTrainer):
         new_labels = updated_slice["labels"]
         seq_len = new_input_ids.shape[1]
 
+        # convert_ids_to_tokens is a tokenizer method; VLM processors expose it via `.tokenizer`.
+        tokenizer = self.processing_class.tokenizer if self._is_vlm else self.processing_class
+
         rows: list[list[tuple[int, int]]] = []
         for row_ids, row_labels in zip(new_input_ids.cpu().tolist(), new_labels.cpu().tolist(), strict=True):
             offs: list[tuple[int, int]] = [(0, 0)] * seq_len
@@ -1427,7 +1430,7 @@ class GOLDTrainer(SFTTrainer):
             for pos, (tid, label) in enumerate(zip(row_ids, row_labels, strict=True)):
                 if label == -100:
                     continue
-                nb = piece_byte_len(self.processing_class.convert_ids_to_tokens([tid])[0])
+                nb = piece_byte_len(tokenizer.convert_ids_to_tokens([tid])[0])
                 offs[pos] = (cumulative, cumulative + nb)
                 cumulative += nb
             rows.append(offs)
