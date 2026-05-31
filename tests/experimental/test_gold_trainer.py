@@ -1327,6 +1327,50 @@ def test_vlm_alignment_groups_cover_all_tokens_smolvlm_qwen3vl(smolvlm_processor
     _assert_alignment_covers_completion(loss, batch, teacher_input_ids, teacher_labels, teacher_byte_offsets)
 
 
+def test_build_teacher_vlm_inputs_feeds_images_and_completion_byte_offsets(qwen3_vl_processor, vlm_examples):
+    """Cross-architecture VLM ULD must render the teacher prompt through the teacher processor (so it
+    actually sees the image via pixel_values) while keeping completion byte offsets relative to the
+    original completion text — the coordinate system shared with the student."""
+    trainer = GOLDTrainer.__new__(GOLDTrainer)
+    trainer._teacher_processor = qwen3_vl_processor
+    trainer.teacher_tokenizer = qwen3_vl_processor.tokenizer
+    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+
+    images, prompts = trainer._extract_images_and_prompts(vlm_examples)
+    completion_texts = _get_assistant_texts(vlm_examples)
+
+    (
+        teacher_input_ids,
+        teacher_labels,
+        teacher_attention_mask,
+        teacher_byte_offsets,
+        teacher_forward_kwargs,
+    ) = trainer._build_teacher_vlm_inputs(completion_texts, images, prompts)
+
+    batch_size = len(vlm_examples)
+    seq_len = teacher_input_ids.shape[1]
+    assert teacher_input_ids.shape == teacher_labels.shape == teacher_attention_mask.shape
+    assert teacher_byte_offsets.shape == (batch_size, seq_len, 2)
+    # The teacher actually receives the image, not just text.
+    assert "pixel_values" in teacher_forward_kwargs
+
+    backend = qwen3_vl_processor.tokenizer.backend_tokenizer
+    for row in range(batch_size):
+        completion_positions = teacher_labels[row] != -100
+        # The prompt (image placeholders + text) is masked; the completion is supervised.
+        assert completion_positions.any()
+        assert not completion_positions[0]
+
+        expected_ids, expected_offs = encode_with_byte_offsets(backend, [completion_texts[row]])[0]
+        # Completion ids carry their byte offsets; the appended EOS sits at the end of the content.
+        content_len = len(completion_texts[row].encode("utf-8"))
+        row_completion_ids = teacher_input_ids[row][completion_positions].tolist()
+        row_completion_offs = teacher_byte_offsets[row][completion_positions].tolist()
+        assert row_completion_ids[: len(expected_ids)] == expected_ids
+        assert row_completion_offs[: len(expected_offs)] == [list(off) for off in expected_offs]
+        assert row_completion_offs[-1] == [content_len, content_len]
+
+
 def test_gold_trainer_init_rejects_llm_with_vision_dataset(monkeypatch):
     """GOLDTrainer should raise ValueError when a text-only model receives a vision dataset."""
 

@@ -2185,6 +2185,102 @@ class GOLDTrainer(SFTTrainer):
         else:
             return jsd
 
+    def _build_teacher_vlm_inputs(
+        self, completion_texts: list[str], raw_images: list, raw_prompts: list
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Build image-aware teacher inputs for cross-architecture VLM ULD distillation.
+
+        The teacher prompt is rendered through the teacher's own processor so image placeholders and
+        pixel tensors match the teacher model, while completion tokens carry byte offsets relative to the
+        original ``completion_texts`` — the same coordinate system the student uses — so cross-tokenizer
+        byte-offset alignment stays valid. Mirrors ``build_teacher_inputs_from_texts`` but injects the
+        teacher's multimodal prompt and returns the teacher's forward kwargs (``pixel_values``, ...).
+
+        Returns ``(input_ids, labels, attention_mask, byte_offsets, forward_kwargs)``.
+        """
+        backend = self.teacher_tokenizer.backend_tokenizer
+        pad_token_id = self.teacher_tokenizer.pad_token_id
+        eos_token_id = self.teacher_tokenizer.eos_token_id
+
+        teacher_prompt_texts = self._teacher_processor.apply_chat_template(
+            raw_prompts, tokenize=False, add_generation_prompt=True
+        )
+        teacher_prompt_processed = self._teacher_processor(
+            images=raw_images,
+            text=teacher_prompt_texts,
+            padding=True,
+            return_tensors="pt",
+        )
+        completion_encs = encode_with_byte_offsets(backend, completion_texts, add_special_tokens=False)
+
+        sequences: list[torch.Tensor] = []
+        attention_masks: list[torch.Tensor] = []
+        labels_list: list[torch.Tensor] = []
+        offsets_list: list[list[tuple[int, int]]] = []
+        sequence_kwargs = defaultdict(list)
+
+        for row, ((enc_ids, enc_offs), completion_text) in enumerate(
+            zip(completion_encs, completion_texts, strict=True)
+        ):
+            prompt_mask = teacher_prompt_processed["attention_mask"][row].bool()
+            prompt_ids = teacher_prompt_processed["input_ids"][row][prompt_mask].tolist()
+            # Remove trailing EOS from prompt so completions can extend cleanly
+            if eos_token_id is not None and prompt_ids and prompt_ids[-1] == eos_token_id:
+                prompt_ids = prompt_ids[:-1]
+
+            completion_ids = list(enc_ids)
+            completion_offs = list(enc_offs)
+            content_len = len(completion_text.encode("utf-8"))
+
+            sequence = list(prompt_ids) + completion_ids
+            offsets = [(0, 0)] * len(prompt_ids) + completion_offs
+            if eos_token_id is not None:
+                sequence.append(eos_token_id)
+                offsets.append((content_len, content_len))
+
+            seq_tensor = torch.tensor(sequence, dtype=torch.long)
+            sequences.append(seq_tensor)
+            attention_masks.append(torch.ones_like(seq_tensor))
+            offsets_list.append(offsets)
+
+            labels = seq_tensor.clone()
+            labels[: len(prompt_ids)] = -100
+            if pad_token_id is not None:
+                labels[labels == pad_token_id] = -100
+            labels_list.append(labels)
+
+            # Sequence-aligned multimodal keys (e.g. token_type_ids for Gemma): keep the prompt values
+            # and zero-fill the completion span.
+            for key in self._SEQUENCE_KEYS:
+                if key in teacher_prompt_processed:
+                    prompt_values = teacher_prompt_processed[key][row][prompt_mask][: len(prompt_ids)]
+                    completion_values = torch.zeros(len(sequence) - len(prompt_ids), dtype=prompt_values.dtype)
+                    sequence_kwargs[key].append(torch.cat((prompt_values, completion_values)))
+
+        teacher_input_ids = pad(
+            sequences,
+            padding_side="right",
+            padding_value=pad_token_id if pad_token_id is not None else 0,
+        )
+        teacher_attention_mask = pad(attention_masks, padding_side="right", padding_value=0).bool()
+        teacher_labels = pad(labels_list, padding_side="right", padding_value=-100)
+
+        target_len = teacher_input_ids.size(1)
+        teacher_byte_offsets = torch.stack(
+            [pad_byte_offsets(offs, target_len, padding_side="right") for offs in offsets_list],
+            dim=0,
+        )
+
+        # Multimodal forward kwargs from the teacher processor (pixel_values, image_grid_thw, ...).
+        forward_kwargs = {
+            k: v.to(self.accelerator.device)
+            for k, v in self._get_model_forward_kwargs(teacher_prompt_processed, exclude=self._SEQUENCE_KEYS).items()
+        }
+        for key, values in sequence_kwargs.items():
+            forward_kwargs[key] = pad(values, padding_side="right", padding_value=0).to(self.accelerator.device)
+
+        return teacher_input_ids, teacher_labels, teacher_attention_mask, teacher_byte_offsets, forward_kwargs
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Extract multimodal fields (pixel_values, image_grid_thw, ...) for student forward passes.
         # Standard JSD reuses these for the teacher (same-family VLM); cross-tokenizer ULD rebuilds
@@ -2196,12 +2292,24 @@ class GOLDTrainer(SFTTrainer):
             prompt_texts = inputs["original_prompt_text"]
             completion_texts = inputs["original_completion_text"]
 
-            (
-                teacher_input_ids,
-                teacher_labels,
-                teacher_attention_mask,
-                teacher_completion_byte_offsets,
-            ) = build_teacher_inputs_from_texts(self.teacher_tokenizer, prompt_texts, completion_texts)
+            if self._teacher_processor is not None:
+                # VLM teacher: render the prompt through the teacher's own processor so image
+                # placeholders and pixel tensors match the teacher model.
+                (
+                    teacher_input_ids,
+                    teacher_labels,
+                    teacher_attention_mask,
+                    teacher_completion_byte_offsets,
+                    teacher_forward_kwargs,
+                ) = self._build_teacher_vlm_inputs(completion_texts, inputs["_raw_images"], inputs["_raw_prompts"])
+            else:
+                teacher_forward_kwargs = {}
+                (
+                    teacher_input_ids,
+                    teacher_labels,
+                    teacher_attention_mask,
+                    teacher_completion_byte_offsets,
+                ) = build_teacher_inputs_from_texts(self.teacher_tokenizer, prompt_texts, completion_texts)
 
             teacher_input_ids = teacher_input_ids.to(self.accelerator.device)
             teacher_labels = teacher_labels.to(self.accelerator.device)
@@ -2219,6 +2327,7 @@ class GOLDTrainer(SFTTrainer):
                 outputs_teacher = self.teacher_model(
                     input_ids=teacher_input_ids,
                     attention_mask=teacher_attention_mask,
+                    **teacher_forward_kwargs,
                 )
         else:
             if self.use_liger_gkd_loss:
