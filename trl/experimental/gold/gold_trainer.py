@@ -2193,11 +2193,11 @@ class GOLDTrainer(SFTTrainer):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Build image-aware teacher inputs for cross-architecture VLM ULD distillation.
 
-        The teacher prompt is rendered through the teacher's own processor so image placeholders and
-        pixel tensors match the teacher model, while completion tokens carry byte offsets relative to the
-        original ``completion_texts`` — the same coordinate system the student uses — so cross-tokenizer
-        byte-offset alignment stays valid. Mirrors ``build_teacher_inputs_from_texts`` but injects the
-        teacher's multimodal prompt and returns the teacher's forward kwargs (``pixel_values``, ...).
+        The teacher prompt is rendered through the teacher's own processor so image placeholders and pixel tensors
+        match the teacher model, while completion tokens carry byte offsets relative to the original
+        ``completion_texts`` — the same coordinate system the student uses — so cross-tokenizer byte-offset alignment
+        stays valid. Mirrors ``build_teacher_inputs_from_texts`` but injects the teacher's multimodal prompt and
+        returns the teacher's forward kwargs (``pixel_values``, ...).
 
         Returns ``(input_ids, labels, attention_mask, byte_offsets, forward_kwargs)``.
         """

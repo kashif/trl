@@ -1330,8 +1330,8 @@ def test_vlm_alignment_groups_cover_all_tokens_smolvlm_qwen3vl(smolvlm_processor
 
 def test_build_teacher_vlm_inputs_feeds_images_and_completion_byte_offsets(qwen3_vl_processor, vlm_examples):
     """Cross-architecture VLM ULD must render the teacher prompt through the teacher processor (so it
-    actually sees the image via pixel_values) while keeping completion byte offsets relative to the
-    original completion text — the coordinate system shared with the student."""
+    actually sees the image via pixel_values) while keeping completion byte offsets relative to the original completion
+    text — the coordinate system shared with the student."""
     trainer = GOLDTrainer.__new__(GOLDTrainer)
     trainer._teacher_processor = qwen3_vl_processor
     trainer.teacher_tokenizer = qwen3_vl_processor.tokenizer
