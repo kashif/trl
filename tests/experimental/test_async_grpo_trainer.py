@@ -784,3 +784,103 @@ class TestEpochStop(TrlTestCase):
         # steps for the same 2 epochs. If forks leaked into the epoch count, the forked run would instead
         # stop in FEWER prompt-passes (the pre-fix bug).
         assert forked.state.global_step > no_fork.state.global_step
+
+
+def _zorro_sample(
+    prompt: list[int], completion: list[int], advantage: float, group_id: int, log_prob_base: float = 0.0
+) -> dict:
+    tokens = prompt + completion
+    return {
+        "input_ids": tokens,
+        "completion_mask": [0] * len(prompt) + [1] * len(completion),
+        # Distinctive per-token values so the target alignment is checkable by eye.
+        "old_log_probs": [-(log_prob_base + index / 10) for index in range(len(tokens))],
+        "advantage": advantage,
+        "group_id": group_id,
+        "metrics": {},
+    }
+
+
+class TestZorroBatching(TrlTestCase):
+    """Prompt deduplication is pure scheduling/tensorization, so these run without a GPU."""
+
+    def test_collator_stores_the_shared_prompt_once(self):
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=1, zorro=True)
+        first = _zorro_sample([1, 2], [10, 11], advantage=1.0, group_id=0)
+        second = _zorro_sample([1, 2], [20, 21], advantage=-1.0, group_id=0)
+
+        batch = collator([[[first, second]]])
+
+        assert batch["input_ids"].tolist() == [[1, 2, 10, 11, 20, 21]]  # prompt [1, 2] appears once
+        assert batch["position_ids"].tolist() == [[0, 1, 2, 3, 2, 3]]  # each branch continues the prompt
+        assert batch["segment_ids"].tolist() == [[0, 0, 0, 0, 0, 0]]
+        assert batch["branch_ids"].tolist() == [[-1, -1, 0, 0, 1, 1]]
+        assert batch["dedup_ratio"].tolist() == [0.25]  # 6 packed tokens instead of 8
+
+    def test_collator_aligns_targets_with_their_own_rollout(self):
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=1, zorro=True)
+        first = _zorro_sample([1, 2], [10, 11], advantage=1.0, group_id=0)
+        second = _zorro_sample([1, 2], [20, 21], advantage=-1.0, group_id=0, log_prob_base=1.0)
+
+        batch = collator([[[first, second]]])
+
+        assert batch["target_ids"].tolist() == [[10, 11, 20, 21]]
+        # Both rollouts' first completion token is predicted from the *shared* prompt's last position (index 1).
+        assert batch["gather_idx"].tolist() == [[1, 2, 1, 4]]
+        assert batch["completion_mask"].tolist() == [[1, 1, 1, 1]]  # one entry per target, all real
+        torch.testing.assert_close(
+            batch["old_log_probs"], torch.tensor([[-0.2, -0.3, -1.2, -1.3]]), atol=1e-6, rtol=1e-6
+        )
+        assert batch["advantages"].tolist() == [[1.0, 1.0, -1.0, -1.0]]
+
+    def test_collator_leaves_the_loss_normalizer_unchanged(self):
+        # Deduplication removes prompt tokens only, so the completion-token count the loss divides by must not move.
+        groups = [[_zorro_sample([1, 2, 3], [10, 11], advantage=1.0, group_id=0) for _ in range(3)]]
+        plain = DataCollatorForRollout(pad_token_id=0, num_processes=1)([groups])
+        zorro = DataCollatorForRollout(pad_token_id=0, num_processes=1, zorro=True)([groups])
+
+        assert zorro["global_n_tokens"].tolist() == plain["global_n_tokens"].tolist()
+        assert zorro["input_ids"].numel() < plain["input_ids"].numel()
+
+    def test_collator_pads_tokens_and_targets_on_their_own_axes(self):
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=2, zorro=True)
+        long_row = [_zorro_sample([1, 2, 3], [10, 11], advantage=1.0, group_id=0) for _ in range(2)]
+        short_row = [_zorro_sample([4, 5], [40], advantage=1.0, group_id=1)]
+
+        batch = collator([[long_row, short_row]])
+
+        assert batch["input_ids"].shape[0] == batch["gather_idx"].shape[0] == 2
+        assert batch["input_ids"].shape[1] == 7  # prompt 3 + two tails of 2
+        assert batch["gather_idx"].shape[1] == 4  # two rollouts x two completion tokens
+        assert batch["attention_mask"].tolist()[1] == [1, 1, 1, 0, 0, 0, 0]
+        assert batch["completion_mask"].tolist()[1] == [1, 0, 0, 0]
+
+    def test_collator_falls_back_when_nothing_is_shared(self):
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=1, zorro=True)
+        first = _zorro_sample([1, 2], [10], advantage=1.0, group_id=0)
+        second = _zorro_sample([7, 8], [20], advantage=1.0, group_id=1)
+
+        batch = collator([[[first, second]]])
+
+        assert batch["input_ids"].tolist() == [[1, 2, 10, 7, 8, 20]]
+        assert batch["dedup_ratio"].tolist() == [0.0]
+        assert batch["segment_ids"].tolist() == [[0, 0, 0, 1, 1, 1]]
+
+    def test_balance_keeps_prompt_groups_on_one_row(self):
+        # Σ Lᵢ² alone would split these; ZoRRo can only dedup rollouts that share a rank.
+        samples = [_zorro_sample([1, 2], [10, 11], 1.0, group_id=g) for g in (0, 0, 1, 1)]
+        rows = _balance_by_squared_length(samples, num_groups=2, keep_prompt_groups_together=True)
+
+        assert all(len({sample["group_id"] for sample in row}) == 1 for row in rows)
+        assert sorted(len(row) for row in rows) == [2, 2]
+
+    def test_token_budget_batcher_keeps_prompt_groups_on_one_row(self):
+        # Groups arrive interleaved, so routing has to follow the group rather than the lightest row. The trailing
+        # sample overflows both rows, which is what closes the micro-batch.
+        samples = [_zorro_sample([1, 2], [10, 11], 1.0, group_id=g) for g in (0, 1, 0, 1, 2)]
+        batcher = TokenBudgetBatcher(samples, num_processes=2, token_budget=8, keep_prompt_groups_together=True)
+
+        (rows,) = list(itertools.islice(batcher, 1))
+
+        assert all(len({sample["group_id"] for sample in row}) == 1 for row in rows)
+        assert sorted(len(row) for row in rows) == [2, 2]

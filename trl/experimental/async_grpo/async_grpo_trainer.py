@@ -35,6 +35,7 @@ from transformers.data.data_collator import DataCollatorMixin
 
 from ...trainer.base_trainer import _BaseTrainer
 from ...trainer.utils import get_config_model_id, is_trackio_available, nanmax, nanmin, pad, patch_chunked_lm_head
+from ..zorro import build_zorro_mask, pack_shared_prefix_groups
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutWorker, RolloutSample
 from .vllm_client import VLLMClient
@@ -300,20 +301,34 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
             }
 
 
-def _balance_by_squared_length(examples: list[dict[str, Any]], num_groups: int) -> list[list[dict[str, Any]]]:
+def _balance_by_squared_length(
+    examples: list[dict[str, Any]], num_groups: int, keep_prompt_groups_together: bool = False
+) -> list[list[dict[str, Any]]]:
     """Greedily partition `examples` into `num_groups` rows (one per DP rank), balancing each row's Σ Lᵢ².
 
     Attention is O(L²) while the FFN is O(L), so equal token counts wouldn't equalize wall-time; balancing Σ Lᵢ² keeps
     the per-micro-batch all-reduce free of stragglers. Samples are placed longest-first into the row with the smallest
     running Σ Lᵢ² (LPT scheduling). With at least `num_groups` samples every row ends up non-empty.
+
+    With `keep_prompt_groups_together`, rollouts sharing a prompt are placed as one unit, since ZoRRo can only
+    deduplicate a prompt across rollouts that land on the same rank. Σ Lᵢ² then overestimates the cost of a row that
+    shares a lot, but it overestimates every row by a similar factor, so the balance still holds.
     """
     groups = [[] for _ in range(num_groups)]
     squared_loads = [0] * num_groups
-    for example in sorted(examples, key=lambda e: len(e["input_ids"]), reverse=True):
-        n = len(example["input_ids"])
+
+    if keep_prompt_groups_together:
+        units: dict[Any, list[dict[str, Any]]] = {}
+        for example in examples:
+            units.setdefault(example["group_id"], []).append(example)
+        placeable = sorted(units.values(), key=lambda u: sum(len(e["input_ids"]) ** 2 for e in u), reverse=True)
+    else:
+        placeable = [[example] for example in sorted(examples, key=lambda e: len(e["input_ids"]), reverse=True)]
+
+    for unit in placeable:
         i = min(range(num_groups), key=lambda j: squared_loads[j])
-        groups[i].append(example)
-        squared_loads[i] += n * n
+        groups[i].extend(unit)
+        squared_loads[i] += sum(len(example["input_ids"]) ** 2 for example in unit)
     return groups
 
 
@@ -332,19 +347,28 @@ class FixedCountBatcher(torch.utils.data.IterableDataset):
             Number of DP ranks; the number of rows (one per rank) in each micro-batch.
         microbatch_size (`int`):
             Number of samples buffered into each micro-batch before it is partitioned and emitted.
+        keep_prompt_groups_together (`bool`, *optional*, defaults to `False`):
+            Whether to keep rollouts sharing a prompt on the same rank, so their prompt can be deduplicated.
     """
 
-    def __init__(self, dataset: "RolloutQueueDataset", num_processes: int, microbatch_size: int):
+    def __init__(
+        self,
+        dataset: "RolloutQueueDataset",
+        num_processes: int,
+        microbatch_size: int,
+        keep_prompt_groups_together: bool = False,
+    ):
         self.dataset = dataset
         self.num_processes = num_processes
         self.microbatch_size = microbatch_size
+        self.keep_prompt_groups_together = keep_prompt_groups_together
 
     def __iter__(self):
         batch = []
         for sample in self.dataset:
             batch.append(sample)
             if len(batch) == self.microbatch_size:
-                yield _balance_by_squared_length(batch, self.num_processes)
+                yield _balance_by_squared_length(batch, self.num_processes, self.keep_prompt_groups_together)
                 batch = []
 
 
@@ -371,17 +395,29 @@ class TokenBudgetBatcher(torch.utils.data.IterableDataset):
             Number of DP ranks; the number of rows (one per rank) in each micro-batch.
         token_budget (`int`):
             Maximum real tokens packed into a single row (one rank's forward).
+        keep_prompt_groups_together (`bool`, *optional*, defaults to `False`):
+            Whether to keep rollouts sharing a prompt on the same rank, so their prompt can be deduplicated. Samples
+            are routed to the row that already holds their group whenever it still has room, rather than to the
+            lightest row.
     """
 
-    def __init__(self, dataset: "RolloutQueueDataset", num_processes: int, token_budget: int):
+    def __init__(
+        self,
+        dataset: "RolloutQueueDataset",
+        num_processes: int,
+        token_budget: int,
+        keep_prompt_groups_together: bool = False,
+    ):
         self.dataset = dataset
         self.num_processes = num_processes
         self.token_budget = token_budget
+        self.keep_prompt_groups_together = keep_prompt_groups_together
 
     def __iter__(self):
         rows = [[] for _ in range(self.num_processes)]
         squared_loads = [0] * self.num_processes  # Σ Lᵢ² per row, drives the balancing
         token_counts = [0] * self.num_processes  # tokens per row, drives the budget
+        row_of_group: dict[Any, int] = {}  # group -> row holding it, only used to keep prompt groups together
         for sample in self.dataset:
             n = len(sample["input_ids"])
             if n > self.token_budget:
@@ -399,11 +435,17 @@ class TokenBudgetBatcher(torch.utils.data.IterableDataset):
                 rows = [[] for _ in range(self.num_processes)]
                 squared_loads = [0] * self.num_processes
                 token_counts = [0] * self.num_processes
+                row_of_group = {}
                 fits = list(range(self.num_processes))
-            i = min(fits, key=lambda j: squared_loads[j])
+            # Follow the rest of the prompt group when there is room, so the shared prompt stays deduplicable; a group
+            # split by a full row still trains correctly, it just saves less.
+            home = row_of_group.get(sample["group_id"]) if self.keep_prompt_groups_together else None
+            i = home if home in fits else min(fits, key=lambda j: squared_loads[j])
             rows[i].append(sample)
             squared_loads[i] += n * n
             token_counts[i] += n
+            if self.keep_prompt_groups_together:
+                row_of_group.setdefault(sample["group_id"], i)
 
 
 class _EmptyIterableDataset(torch.utils.data.IterableDataset):
@@ -426,11 +468,22 @@ class DataCollatorForRollout(DataCollatorMixin):
     ([`FixedCountBatcher`] or [`TokenBudgetBatcher`]) — which balances each row's Σ Lᵢ² (attention cost) to avoid
     stragglers at the gradient all-reduce — so the collator only tensorizes the given rows.
 
+    With `zorro`, a row stores each prompt once per rollout group rather than once per rollout, and carries the
+    bookkeeping that layout needs: `segment_ids` / `branch_ids` for the attention mask, and `gather_idx` /
+    `target_ids` for the positions to score. Those last two are indexed by target rather than by token, so
+    `old_log_probs`, `advantages` and `completion_mask` are emitted per target too, and padded on their own axis.
+
     Args:
         pad_token_id (`int`):
             Token id used to pad `input_ids`.
         num_processes (`int`, *optional*, defaults to `1`):
             Number of DP ranks; the micro-batch is packed into this many rows.
+        zorro (`bool`, *optional*, defaults to `False`):
+            Whether to store each prompt once per rollout group instead of once per rollout.
+        zorro_min_group_size (`int`, *optional*, defaults to `2`):
+            Minimum number of rollouts sharing a prompt before their prompt is deduplicated.
+        zorro_min_prefix_length (`int`, *optional*, defaults to `0`):
+            Minimum shared prefix length, in tokens, before a prompt is deduplicated.
     """
 
     pad_token_id: int
@@ -438,11 +491,16 @@ class DataCollatorForRollout(DataCollatorMixin):
     return_tensors: str = "pt"
     # Distinct prompt-group ids, it counts exactly the prompt-groups that get trained
     groups_trained: set[int] = field(default_factory=set)
+    zorro: bool = False
+    zorro_min_group_size: int = 2
+    zorro_min_prefix_length: int = 0
 
     def torch_call(self, examples: list[Any]) -> dict[str, Any]:
         # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into `num_processes`
         # rows, so `examples` is a length-1 list holding that single micro-batch (one group per rank).
         (groups,) = examples
+        if self.zorro:
+            return self._zorro_call(groups)
 
         input_ids, attention_mask, completion_mask, old_log_probs, position_ids, advantages = [], [], [], [], [], []
         for group in groups:
@@ -470,10 +528,73 @@ class DataCollatorForRollout(DataCollatorMixin):
         position_ids = pad(position_ids, padding_value=0)
         advantages = pad(advantages, padding_value=0.0)
 
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "completion_mask": completion_mask,
+            "old_log_probs": old_log_probs,
+            "position_ids": position_ids,
+            "advantages": advantages,
+            **self._batch_metadata(groups),
+        }
+
+    def _zorro_call(self, groups: list[list[dict[str, Any]]]) -> dict[str, Any]:
+        """Pack each row with one copy of every shared prompt, plus the bookkeeping that layout needs."""
+        input_ids, attention_mask, position_ids, segment_ids, branch_ids = [], [], [], [], []
+        gather_idx, target_ids, completion_mask, old_log_probs, advantages = [], [], [], [], []
+        packed_tokens, unpacked_tokens = 0, 0
+
+        for group in groups:
+            layout = pack_shared_prefix_groups(
+                input_ids=[example["input_ids"] for example in group],
+                completion_mask=[example["completion_mask"] for example in group],
+                group_ids=[example["group_id"] for example in group],
+                min_group_size=self.zorro_min_group_size,
+                min_prefix_length=self.zorro_min_prefix_length,
+            )
+            input_ids.append(layout.input_ids)
+            attention_mask.append(torch.ones(layout.num_tokens, dtype=torch.long))
+            position_ids.append(layout.position_ids)
+            segment_ids.append(layout.segment_ids)
+            branch_ids.append(layout.branch_ids)
+            gather_idx.append(layout.gather_idx)
+            target_ids.append(layout.target_ids)
+            # Every packed target is a real one; the mask only marks the inter-rank padding added below.
+            completion_mask.append(torch.ones(layout.target_ids.numel(), dtype=torch.long))
+            # `old_log_probs[t]` is the log probability *of* token `t`, so a target is scored against the entry at its
+            # own token index -- the same pairing the shift in the non-ZoRRo path produces.
+            targets = list(zip(layout.target_sample_idx.tolist(), layout.target_token_idx.tolist(), strict=True))
+            old_log_probs.append(torch.tensor([group[s]["old_log_probs"][t] for s, t in targets], dtype=torch.float32))
+            advantages.append(torch.tensor([group[s]["advantage"] for s, _ in targets], dtype=torch.float32))
+            packed_tokens += layout.num_tokens
+            unpacked_tokens += layout.num_tokens_unpacked
+
+        return {
+            "input_ids": pad(input_ids, padding_value=self.pad_token_id),
+            "attention_mask": pad(attention_mask, padding_value=0),
+            "position_ids": pad(position_ids, padding_value=0),
+            # Padded token slots are stripped before the forward, so these values are never read; -1 keeps them from
+            # looking like a real group if they ever were.
+            "segment_ids": pad(segment_ids, padding_value=-1),
+            "branch_ids": pad(branch_ids, padding_value=-1),
+            "gather_idx": pad(gather_idx, padding_value=0),
+            "target_ids": pad(target_ids, padding_value=0),
+            "completion_mask": pad(completion_mask, padding_value=0),
+            "old_log_probs": pad(old_log_probs, padding_value=0.0),
+            "advantages": pad(advantages, padding_value=0.0),
+            "dedup_ratio": torch.full(
+                (self.num_processes,), 1.0 - packed_tokens / max(unpacked_tokens, 1), dtype=torch.float32
+            ),
+            **self._batch_metadata(groups),
+        }
+
+    def _batch_metadata(self, groups: list[list[dict[str, Any]]]) -> dict[str, Any]:
+        """Fields that do not depend on how the rows are packed."""
         all_examples = [example for group in groups for example in group]
         self.groups_trained.update(example["group_id"] for example in all_examples)
 
-        # Total valid completion tokens across all samples in the full batch.
+        # Total valid completion tokens across all samples in the full batch. Deduplication removes prompt tokens
+        # only, so this -- and the loss normalization that divides by it -- is the same with and without ZoRRo.
         # Repeated per rank so that DataLoaderDispatcher (dispatch_batches=True) slices correctly on dim=0
         global_n_tokens = sum(sum(example["completion_mask"]) for example in all_examples)
         global_n_tokens = torch.full((self.num_processes,), float(global_n_tokens), dtype=torch.float32)
@@ -497,16 +618,7 @@ class DataCollatorForRollout(DataCollatorMixin):
             else {}
         )
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "completion_mask": completion_mask,
-            "old_log_probs": old_log_probs,
-            "position_ids": position_ids,
-            "advantages": advantages,
-            "global_n_tokens": global_n_tokens,
-            "metrics": metrics,
-        }
+        return {"global_n_tokens": global_n_tokens, "metrics": metrics}
 
 
 class AsyncGRPOTrainer(_BaseTrainer):
@@ -668,13 +780,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
         model_init_kwargs.setdefault("trust_remote_code", args.trust_remote_code)
         # FlashAttention is required: training runs in padding-free mode, where sequences are concatenated into a
         # single row and `cu_seq_lens` are derived from `position_ids` resets. SDPA/eager can't handle this.
+        # ZoRRo is the exception: its rows are not a plain concatenation, so the layout has to be expressed as an
+        # attention mask -- which FlashAttention does not take.
+        self.zorro = args.zorro
+        attn_implementation = "sdpa" if self.zorro else "kernels-community/flash-attn3"
         model = AutoModelForCausalLM.from_pretrained(
             model,
             device_map=None,
             dtype=torch.float32,
-            attn_implementation="kernels-community/flash-attn3",
+            attn_implementation=attn_implementation,
             **model_init_kwargs,
         )
+        self._zorro_attn_implementation = attn_implementation
 
         if args.use_liger_kernel:
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")
@@ -874,10 +991,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
             # TokenBudgetBatcher caps each row at `token_budget` tokens (dynamic count, bounds peak memory);
             # FixedCountBatcher uses a fixed `per_device_train_batch_size × num_processes` samples per micro-batch.
             if self.args.token_budget > 0:
-                dataset = TokenBudgetBatcher(dataset, num_processes, self.args.token_budget)
+                dataset = TokenBudgetBatcher(dataset, num_processes, self.args.token_budget, self.zorro)
             else:
                 dataset = FixedCountBatcher(
-                    dataset, num_processes, self.args.per_device_train_batch_size * num_processes
+                    dataset, num_processes, self.args.per_device_train_batch_size * num_processes, self.zorro
                 )
         else:
             dataset = _EmptyIterableDataset()
@@ -890,7 +1007,12 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 dataset,
                 batch_size=1,
                 collate_fn=DataCollatorForRollout(
-                    self.processing_class.pad_token_id, num_processes, groups_trained=self._trained_groups
+                    self.processing_class.pad_token_id,
+                    num_processes,
+                    groups_trained=self._trained_groups,
+                    zorro=self.zorro,
+                    zorro_min_group_size=self.args.zorro_min_group_size,
+                    zorro_min_prefix_length=self.args.zorro_min_prefix_length,
                 ),
                 num_workers=0,
                 # NOTE(@aminediro):
@@ -914,6 +1036,12 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "advantages",
                 "global_n_tokens",
                 "metrics",
+                # ZoRRo only
+                "segment_ids",
+                "branch_ids",
+                "gather_idx",
+                "target_ids",
+                "dedup_ratio",
             ]
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -923,25 +1051,48 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # here.
         mask_bool = inputs["attention_mask"].bool()
         input_ids = inputs["input_ids"][mask_bool].unsqueeze(0)
-        completion_mask = inputs["completion_mask"][mask_bool].unsqueeze(0)
-        old_log_probs = inputs["old_log_probs"][mask_bool].unsqueeze(0)
         position_ids = inputs["position_ids"][mask_bool].unsqueeze(0)
-        advantages = inputs["advantages"][mask_bool].unsqueeze(0)
+
+        if self.zorro:
+            # The row shares each prompt across its rollout group, so the positions to score and the tokens they
+            # predict are given explicitly instead of being derived by shifting the row, and attention runs under a
+            # mask that keeps sibling rollouts from seeing each other. Everything below is untouched: the loss reads
+            # the same per-target tensors either way.
+            target_bool = inputs["completion_mask"].bool()
+            completion_mask = inputs["completion_mask"][target_bool].unsqueeze(0)
+            old_log_probs = inputs["old_log_probs"][target_bool].unsqueeze(0)
+            advantages = inputs["advantages"][target_bool].unsqueeze(0)
+            forward_kwargs = {
+                "gather_idx": inputs["gather_idx"][target_bool].unsqueeze(0),
+                "target_ids": inputs["target_ids"][target_bool].unsqueeze(0),
+                "attention_mask": build_zorro_mask(
+                    inputs["segment_ids"][mask_bool].unsqueeze(0),
+                    inputs["branch_ids"][mask_bool].unsqueeze(0),
+                    self._zorro_attn_implementation,
+                    dtype=self.model.dtype,
+                ),
+            }
+        else:
+            completion_mask = inputs["completion_mask"][mask_bool].unsqueeze(0)
+            old_log_probs = inputs["old_log_probs"][mask_bool].unsqueeze(0)
+            advantages = inputs["advantages"][mask_bool].unsqueeze(0)
+            forward_kwargs = {"labels": input_ids, "completion_mask": completion_mask}
 
         forward_start = time.time()
         outputs = model(
             input_ids=input_ids,
             position_ids=position_ids,
-            labels=input_ids,
-            completion_mask=completion_mask,
             use_cache=False,
+            **forward_kwargs,
         )
         log_probs, entropy = outputs["log_probs"], outputs["entropy"]
         self._last_forward_time_s = time.time() - forward_start
 
-        completion_mask = completion_mask[:, 1:]
-        old_log_probs = old_log_probs[:, 1:]
-        advantages = advantages[:, 1:]
+        if not self.zorro:
+            # Shift onto the tokens being predicted; with ZoRRo these are already per-target.
+            completion_mask = completion_mask[:, 1:]
+            old_log_probs = old_log_probs[:, 1:]
+            advantages = advantages[:, 1:]
         log_ratio = log_probs - old_log_probs
         coef_1 = torch.exp(log_ratio)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
@@ -1084,6 +1235,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self._metrics["train"]["forward_time_s"].append(self._last_forward_time_s)
             # NOTE: in dynamic mbs setup, we would need to agg across DP ranks.
             self._metrics["train"]["train_seq_len"].append(float(position_ids.max() + 1))
+            if self.zorro:
+                # Fraction of tokens prompt sharing removed. Stays at 0 when rollouts of a prompt never land on the
+                # same rank, which is the failure mode to watch for when ZoRRo appears to do nothing.
+                self._metrics["train"]["zorro/dedup_ratio"].append(inputs["dedup_ratio"][0].item())
         return loss
 
     def training_step(self, model, inputs, num_items_in_batch):

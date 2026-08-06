@@ -129,6 +129,18 @@ class AsyncGRPOConfig(_BaseConfig):
         num_completions_to_print (`int`, *optional*):
             Number of completions to print with `rich`. If `None`, all completions are logged.
 
+        > Parameters that control ZoRRo prompt deduplication
+
+        zorro (`bool`, *optional*, defaults to `False`):
+            Whether to store each prompt once per rollout group instead of once per rollout. Rollouts sampled from
+            the same prompt are packed as a shared prefix followed by each rollout's own tokens, which cuts both the
+            tokens the model runs over and the quadratic attention cost. The training objective is unchanged.
+            Requires an attention implementation that accepts an attention mask.
+        zorro_min_group_size (`int`, *optional*, defaults to `2`):
+            Minimum number of rollouts sharing a prompt before their prompt is deduplicated.
+        zorro_min_prefix_length (`int`, *optional*, defaults to `0`):
+            Minimum shared prefix length, in tokens, before a prompt is deduplicated.
+
     > [!NOTE]
     > These parameters have default values different from [`~transformers.TrainingArguments`]:
     > - `logging_steps`: Defaults to `1` instead of `500`.
@@ -355,6 +367,31 @@ class AsyncGRPOConfig(_BaseConfig):
     num_completions_to_print: int | None = field(
         default=None,
         metadata={"help": "Number of completions to print with `rich`. If `None`, all completions are logged."},
+    )
+
+    # Parameters that control ZoRRo prompt deduplication
+    zorro: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to store each prompt once per rollout group instead of once per rollout (ZoRRo). "
+            "Rollouts sampled from the same prompt are packed as a shared prefix followed by each rollout's own "
+            "tokens, which cuts both the tokens the model runs over and the quadratic attention cost. The training "
+            "objective is unchanged. Requires an attention implementation that accepts an attention mask."
+        },
+    )
+    zorro_min_group_size: int = field(
+        default=2,
+        metadata={
+            "help": "Minimum number of rollouts sharing a prompt before their prompt is deduplicated. Only used when "
+            "`zorro` is `True`."
+        },
+    )
+    zorro_min_prefix_length: int = field(
+        default=0,
+        metadata={
+            "help": "Minimum shared prefix length, in tokens, before a prompt is deduplicated. Sharing a very short "
+            "prefix costs more in bookkeeping than it saves in attention. Only used when `zorro` is `True`."
+        },
     )
 
     def __post_init__(self):
