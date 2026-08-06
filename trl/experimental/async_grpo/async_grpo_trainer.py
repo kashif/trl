@@ -791,7 +791,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
             attn_implementation=attn_implementation,
             **model_init_kwargs,
         )
-        self._zorro_attn_implementation = attn_implementation
+        # Read back what the model actually resolved to, so the mask is always built for the implementation in use.
+        self._zorro_attn_implementation = model.config._attn_implementation
 
         if args.use_liger_kernel:
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")
@@ -855,6 +856,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
         # self.model_accepts_loss_kwargs to False to enable scaling.
         self.model_accepts_loss_kwargs = False
+
+        if self.zorro:
+            self._check_zorro_support()
 
         # Epoch handling: stop after num_train_epochs full passes over the PROMPT dataset, counted as distinct
         # prompt-groups trained (fork-independent).
@@ -1043,6 +1047,40 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "target_ids",
                 "dedup_ratio",
             ]
+
+    def _check_zorro_support(self):
+        """Refuse the setups where ZoRRo's attention mask would be silently ignored or overridden.
+
+        Both failures below are invisible at runtime -- the loss still looks reasonable while rollouts attend to tokens
+        they must not see -- so they are caught here rather than left to produce quietly wrong gradients.
+        """
+        # A prepared 4D mask is handed back untouched by *every* mask factory, including the sliding-window and
+        # linear-attention ones. On a model with such layers, those layers would receive this full-attention mask and
+        # read the whole shared prefix instead of their own window.
+        text_config = self.model.config.get_text_config()
+        layer_types = set(getattr(text_config, "layer_types", None) or ["full_attention"])
+        has_sliding_window = (
+            getattr(text_config, "sliding_window", None) is not None
+            and getattr(text_config, "use_sliding_window", True) is not False
+        )
+        if layer_types != {"full_attention"} or has_sliding_window:
+            raise ValueError(
+                f"`zorro=True` supports models whose layers all use full attention, but "
+                f"{get_config_model_id(self.model.config)} uses {sorted(layer_types)}. ZoRRo passes a prepared "
+                "attention mask, which sliding-window and linear-attention layers would apply as if it were their "
+                "own, letting them attend beyond their window."
+            )
+
+        # Context parallelism shards the sequence dimension, which would cut a shared prefix away from the rollouts
+        # that depend on it. Accelerate also replaces the mask with `is_causal=True` in SDPA, which would drop the
+        # ZoRRo mask entirely and let sibling rollouts attend to each other.
+        parallelism_config = getattr(self.accelerator, "parallelism_config", None)
+        if parallelism_config is not None and getattr(parallelism_config, "cp_enabled", False):
+            raise ValueError(
+                "`zorro=True` is not compatible with context parallelism: sharding the sequence dimension splits a "
+                "shared prompt from the rollouts that attend to it, and the ZoRRo attention mask is replaced by a "
+                "plain causal one. Disable one of the two."
+            )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Padding-free: the collator already packed this rank's samples into a single row (real tokens concatenated,

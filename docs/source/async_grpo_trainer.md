@@ -93,7 +93,7 @@ without ZoRRo                        with ZoRRo
 └──────────────┴────────────┘
 ```
 
-Attention runs under a mask that makes this equivalent to the unpacked layout: every rollout reads the whole prompt and its own tokens, and never sees a sibling. **The training objective is unchanged** — same loss, same normalization, same gradients. Only the prompt is shared, so the completion-token count the loss divides by is exactly what it would be without ZoRRo.
+Attention runs under a mask that makes this equivalent to the unpacked layout: every rollout reads the whole prompt and its own tokens, and never sees a sibling. **The training objective is unchanged**: same loss, same normalization, same gradients. Only the prompt is shared, so the completion-token count the loss divides by is exactly what it would be without ZoRRo.
 
 The method was introduced by Snowflake AI Research in [Zero Redundancy Rollouts (ZoRRo): Breaking the Speed-of-Light for Enterprise RL Training](https://www.snowflake.com/en/blog/engineering/zorro-enterprise-rl-training/), with a reference implementation in [Arctic Platform](https://github.com/Snowflake-AI-Research/Arctic-Platform). Similar ideas were independently explored by [PrefixGrouper](https://github.com/CASIA-IVA-Lab/PrefixGrouper).
 
@@ -123,7 +123,7 @@ The saving is driven by the fraction of tokens that are duplicated prompt:
 
 Long prompts with many rollouts win big; short prompts with long completions barely move. Attention is quadratic on top of this, so removing duplicated prompt tokens saves more than the token count alone suggests.
 
-The trainer logs `zorro/dedup_ratio`, the fraction of tokens actually removed. ZoRRo can only deduplicate rollouts that land on the same rank in the same micro-batch; with `zorro=True` the batchers place whole prompt groups as a unit, so this normally takes care of itself. A group whose rollouts are dropped for staleness, or split because a row hit its `token_budget`, simply shares less — training stays correct, it just saves less. **A `dedup_ratio` near zero with `num_generations > 1` means groups are being split**, and raising `token_budget` is usually the fix.
+The trainer logs `zorro/dedup_ratio`, the fraction of tokens actually removed. ZoRRo can only deduplicate rollouts that land on the same rank in the same micro-batch; with `zorro=True` the batchers place whole prompt groups as a unit, so this normally takes care of itself. A group whose rollouts are dropped for staleness, or split because a row hit its `token_budget`, simply shares less, and training stays correct; it just saves less. **A `dedup_ratio` near zero with `num_generations > 1` means groups are being split**, and raising `token_budget` is usually the fix.
 
 ### How it works
 
@@ -137,7 +137,8 @@ Two knobs guard against sharing that does not pay for itself: `zorro_min_group_s
 
 - **Attention implementation.** ZoRRo expresses its layout as an attention mask, which FlashAttention does not accept, so the trainer uses SDPA when `zorro=True`. A FlashAttention path via split attention (one pass over the shared prompt, one for each rollout against prompt + itself, as described in the blog post) is not implemented yet.
 - **Text-only.** Multimodal rollouts are not supported.
-- **Full attention only.** Sliding-window and hybrid-attention models are not supported, since the mask does not carry their overlay.
+- **Full attention only.** Sliding-window and hybrid-attention models are rejected at initialization. A prepared mask is handed back untouched by every mask factory, so those layers would apply the full-attention mask as their own and read past their window.
+- **No context parallelism.** Sharding the sequence dimension would separate a shared prompt from the rollouts attending to it, and the mask would be replaced by a plain causal one. The combination is rejected at initialization.
 - **MoE auxiliary loss.** The load-balancing loss is computed over the packed sequence, so its token normalization differs slightly from the unpacked batch.
 
 ## Design philosophy

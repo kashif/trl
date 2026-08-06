@@ -64,9 +64,9 @@ def build_zorro_mask(
     Build the attention mask for a packed batch, in the format the given attention implementation expects.
 
     Dispatch goes through [`~transformers.masking_utils.ALL_MASK_ATTENTION_FUNCTIONS`], so `"sdpa"` gets a 4D boolean
-    mask, `"eager"` a 4D float mask and `"flex_attention"` a `BlockMask` that lets flex skip the empty blocks — which
-    is where the shared-prefix layout turns into an actual speedup. The resulting mask is passed straight to the model
-    as `attention_mask`; already-prepared masks are forwarded untouched by
+    mask, `"eager"` a 4D float mask and `"flex_attention"` a `BlockMask` that lets flex skip the empty blocks, which is
+    where the shared-prefix layout turns into an actual speedup. The resulting mask is passed straight to the model as
+    `attention_mask`; already-prepared masks are forwarded untouched by
     [`~transformers.masking_utils.create_causal_mask`], so no model code has to be patched.
 
     FlashAttention takes no arbitrary mask and is handled by a dedicated attention implementation instead.

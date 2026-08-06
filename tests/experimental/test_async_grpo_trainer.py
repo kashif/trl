@@ -903,3 +903,24 @@ class TestZorroBatching(TrlTestCase):
 
         assert all(len({sample["group_id"] for sample in row}) == 1 for row in rows)
         assert sorted(len(row) for row in rows) == [2, 2]
+
+
+class TestZorroSupportChecks(TrlTestCase):
+    """ZoRRo runs on SDPA, so unlike the rest of the trainer these need no FlashAttention-capable GPU."""
+
+    def _build(self, model_id, **config_kwargs):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_completion", split="train")
+        return AsyncGRPOTrainer(
+            model=model_id,
+            args=AsyncGRPOConfig(output_dir=self.tmp_dir, **config_kwargs),
+            reward_funcs=dummy_reward_func,
+            train_dataset=dataset,
+            rollout_worker=_StubRolloutWorker(AutoTokenizer.from_pretrained(model_id), dataset, num_generations=3),
+            weight_transfer=_StubWeightTransfer(),
+        )
+
+    def test_rejects_models_with_non_full_attention_layers(self):
+        # A prepared mask is handed back untouched by every mask factory, including the sliding-window one, so those
+        # layers would apply the full-attention ZoRRo mask as their own and read past their window, with no error.
+        with pytest.raises(ValueError, match="full attention"):
+            self._build("trl-internal-testing/tiny-Gemma2ForCausalLM", zorro=True)
