@@ -469,9 +469,9 @@ class DataCollatorForRollout(DataCollatorMixin):
     stragglers at the gradient all-reduce — so the collator only tensorizes the given rows.
 
     With `zorro`, a row stores each prompt once per rollout group rather than once per rollout, and carries the
-    bookkeeping that layout needs: `segment_ids` / `branch_ids` for the attention mask, and `gather_idx` /
-    `target_ids` for the positions to score. Those last two are indexed by target rather than by token, so
-    `old_log_probs`, `advantages` and `completion_mask` are emitted per target too, and padded on their own axis.
+    bookkeeping that layout needs: `segment_ids` / `branch_ids` for the attention mask, and `gather_idx` / `target_ids`
+    for the positions to score. Those last two are indexed by target rather than by token, so `old_log_probs`,
+    `advantages` and `completion_mask` are emitted per target too, and padded on their own axis.
 
     Args:
         pad_token_id (`int`):

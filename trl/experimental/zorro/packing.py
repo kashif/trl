@@ -40,8 +40,8 @@ class ZoRRoLayout:
             Group index of shape `(num_tokens,)`. Tokens from different groups never attend to each other.
         branch_ids (`torch.Tensor`):
             Branch index within the group, of shape `(num_tokens,)`. Shared-prefix tokens are `-1`; tail tokens carry
-            the index of the rollout they belong to. A token attends to a key when the key is shared prefix
-            (`branch_id == -1`) or belongs to the same branch.
+            the index of the rollout they belong to. A token attends to a key when the key is shared prefix (`branch_id
+            == -1`) or belongs to the same branch.
         gather_idx (`torch.Tensor`):
             Packed positions of shape `(num_targets,)` whose hidden state predicts `target_ids`.
         target_ids (`torch.Tensor`):
@@ -144,6 +144,7 @@ def pack_shared_prefix_groups(
     ... )
     >>> layout.input_ids.tolist()  # prompt [1, 2] stored once, followed by both completions
     [1, 2, 3, 4]
+
     >>> layout.branch_ids.tolist()
     [-1, -1, 0, 1]
     ```

@@ -76,6 +76,70 @@ CUDA_VISIBLE_DEVICES=0 VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3-4B \
 CUDA_VISIBLE_DEVICES=1 accelerate launch train_async_grpo.py
 ```
 
+## Deduplicating shared prompts with ZoRRo
+
+Every prompt is rolled out `num_generations` times, so training embeds, attends over and back-propagates through the *same* prompt once per rollout. For long-prompt workloads the prompt dwarfs the completion, and this redundancy dominates the step time.
+
+ZoRRo (Zero Redundancy Rollouts) removes it. Rollouts sampled from the same prompt are packed into one sequence holding the shared prompt once, followed by each rollout's own tokens:
+
+```txt
+without ZoRRo                        with ZoRRo
+┌──────────────┬────────────┐        ┌──────────────┬────────────┬────────────┬────────────┐
+│    prompt    │ completion₀│        │    prompt    │ completion₀│ completion₁│ completion₂│
+├──────────────┼────────────┤        └──────────────┴────────────┴────────────┴────────────┘
+│    prompt    │ completion₁│
+├──────────────┼────────────┤        one copy of the prompt instead of three
+│    prompt    │ completion₂│
+└──────────────┴────────────┘
+```
+
+Attention runs under a mask that makes this equivalent to the unpacked layout: every rollout reads the whole prompt and its own tokens, and never sees a sibling. **The training objective is unchanged** — same loss, same normalization, same gradients. Only the prompt is shared, so the completion-token count the loss divides by is exactly what it would be without ZoRRo.
+
+The method was introduced by Snowflake AI Research in [Zero Redundancy Rollouts (ZoRRo): Breaking the Speed-of-Light for Enterprise RL Training](https://www.snowflake.com/en/blog/engineering/zorro-enterprise-rl-training/), with a reference implementation in [Arctic Platform](https://github.com/Snowflake-AI-Research/Arctic-Platform). Similar ideas were independently explored by [PrefixGrouper](https://github.com/CASIA-IVA-Lab/PrefixGrouper).
+
+Enable it with a single flag:
+
+```python
+training_args = AsyncGRPOConfig(
+    output_dir="Qwen3-0.6B-GRPO",
+    num_generations=16,  # the more rollouts share a prompt, the more there is to save
+    zorro=True,
+)
+```
+
+Rewards, advantages, staleness handling and vLLM generation are untouched.
+
+### When it helps
+
+The saving is driven by the fraction of tokens that are duplicated prompt:
+
+| Prompt length | Completion length | Rollouts per prompt | Tokens removed |
+| --- | --- | --- | --- |
+| 8192 | 1024 | 16 | 83% |
+| 8192 | 1024 | 4 | 67% |
+| 1024 | 1024 | 16 | 47% |
+| 1024 | 4096 | 8 | 18% |
+| any | any | 1 | 0% |
+
+Long prompts with many rollouts win big; short prompts with long completions barely move. Attention is quadratic on top of this, so removing duplicated prompt tokens saves more than the token count alone suggests.
+
+The trainer logs `zorro/dedup_ratio`, the fraction of tokens actually removed. ZoRRo can only deduplicate rollouts that land on the same rank in the same micro-batch; with `zorro=True` the batchers place whole prompt groups as a unit, so this normally takes care of itself. A group whose rollouts are dropped for staleness, or split because a row hit its `token_budget`, simply shares less — training stays correct, it just saves less. **A `dedup_ratio` near zero with `num_generations > 1` means groups are being split**, and raising `token_budget` is usually the fix.
+
+### How it works
+
+Sharing is computed as the longest common prefix within a group rather than an exact prompt match, so rollouts whose prompts agree only up to some point still share that much. `position_ids` restart at the end of the prefix for every rollout, keeping rotary embeddings identical to the unpacked layout. The mask then lets a query attend to a key only if they share a group *and* the key is either shared prefix or part of the query's own rollout; it is handed to the model as `attention_mask`, which transformers passes straight through, so no model code is patched.
+
+One subtlety worth knowing: the shared prefix's last position predicts the first completion token of *every* rollout in the group. Shifting the packed row by one would pair it with only the first rollout, so the positions to score and the tokens they predict are passed explicitly to the chunked lm head.
+
+Two knobs guard against sharing that does not pay for itself: `zorro_min_group_size` (default `2`) and `zorro_min_prefix_length` (default `0`). Below either threshold the group falls back to plain packing, which is exactly the non-ZoRRo layout.
+
+### Limitations
+
+- **Attention implementation.** ZoRRo expresses its layout as an attention mask, which FlashAttention does not accept, so the trainer uses SDPA when `zorro=True`. A FlashAttention path via split attention (one pass over the shared prompt, one for each rollout against prompt + itself, as described in the blog post) is not implemented yet.
+- **Text-only.** Multimodal rollouts are not supported.
+- **Full attention only.** Sliding-window and hybrid-attention models are not supported, since the mask does not carry their overlay.
+- **MoE auxiliary loss.** The load-balancing loss is computed over the packed sequence, so its token normalization differs slightly from the unpacked batch.
+
 ## Design philosophy
 
 This trainer is intentionally kept minimal and is not meant to grow into a general-purpose solution. If you need a feature that is not supported, we recommend cloning the repository and adapting the trainer to your needs directly. New features will only be considered when there is significant community demand.

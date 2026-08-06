@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import collections
 import itertools
 import math
 import multiprocessing as mp
@@ -873,6 +874,24 @@ class TestZorroBatching(TrlTestCase):
 
         assert all(len({sample["group_id"] for sample in row}) == 1 for row in rows)
         assert sorted(len(row) for row in rows) == [2, 2]
+
+    def test_balance_places_every_sample_exactly_once_when_grouping(self):
+        # Bucketing by group must not drop or duplicate anything, whatever the group sizes are.
+        samples = [
+            _zorro_sample([1, 2], [10] * length, 1.0, group_id=group_id)
+            for group_id, length in ((0, 3), (1, 1), (0, 2), (2, 4), (1, 2), (0, 1))
+        ]
+        rows = _balance_by_squared_length(samples, num_groups=2, keep_prompt_groups_together=True)
+
+        flat = [sample for row in rows for sample in row]
+        assert len(flat) == len(samples)
+        assert all(any(sample is placed for placed in flat) for sample in samples)
+        # More groups than rows, so a row may hold several groups -- what matters is that no group is split.
+        rows_holding = collections.defaultdict(set)
+        for index, row in enumerate(rows):
+            for sample in row:
+                rows_holding[sample["group_id"]].add(index)
+        assert all(len(indices) == 1 for indices in rows_holding.values())
 
     def test_token_budget_batcher_keeps_prompt_groups_on_one_row(self):
         # Groups arrive interleaved, so routing has to follow the group rather than the lightest row. The trailing

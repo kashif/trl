@@ -273,9 +273,16 @@ class TestZorroEquivalence(TrlTestCase):
     CHUNK_SIZE = 16
     TEMPERATURE = 0.7
 
-    def make_model(self):
-        model = AutoModelForCausalLM.from_pretrained(self.MODEL_ID, attn_implementation="sdpa", dtype=torch.float32)
-        patch_chunked_lm_head(model, chunk_size=self.CHUNK_SIZE, temperature=self.TEMPERATURE)
+    def make_model(self, model_id=None, output_router_logits=False):
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id or self.MODEL_ID, attn_implementation="sdpa", dtype=torch.float32
+        )
+        patch_chunked_lm_head(
+            model,
+            chunk_size=self.CHUNK_SIZE,
+            temperature=self.TEMPERATURE,
+            output_router_logits=output_router_logits,
+        )
         return model
 
     @staticmethod
@@ -351,3 +358,40 @@ class TestZorroEquivalence(TrlTestCase):
             assert (param.grad is None) == (reference is None), name
             if param.grad is not None:
                 torch.testing.assert_close(param.grad, reference, atol=1e-4, rtol=1e-4, msg=f"grad mismatch: {name}")
+
+    @pytest.mark.parametrize(
+        "model_id",
+        ["trl-internal-testing/tiny-Qwen3ForCausalLM", "trl-internal-testing/tiny-Qwen3MoeForCausalLM"],
+    )
+    def test_logprobs_match_across_architectures(self, model_id):
+        # Mirrors the architecture sweep of the ZoRRo reference GPU test suite
+        # (`tests/zorro_train/test_once_patcher.py`), which covers dense and MoE checkpoints.
+        input_ids, completion_mask, group_ids = make_group(3, prompt_len=10, completion_len=4, group_id=0)
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+        model = self.make_model(model_id)
+
+        with torch.no_grad():
+            expected = self.unpacked_logprobs(model, input_ids, completion_mask)
+            actual = self.packed_logprobs(model, layout)
+
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+    def test_moe_aux_loss_is_finite(self):
+        # The auxiliary loss reads the attention mask to count tokens; with ZoRRo that argument is a prepared 4D
+        # mask rather than a padding mask, so it has to be dropped instead of counted.
+        input_ids, completion_mask, group_ids = make_group(2, prompt_len=6, completion_len=3, group_id=0)
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+        model = self.make_model("trl-internal-testing/tiny-Qwen3MoeForCausalLM", output_router_logits=True)
+
+        segment_ids, branch_ids = layout.segment_ids.unsqueeze(0), layout.branch_ids.unsqueeze(0)
+        outputs = model(
+            input_ids=layout.input_ids.unsqueeze(0),
+            position_ids=layout.position_ids.unsqueeze(0),
+            attention_mask=build_zorro_mask(segment_ids, branch_ids, "sdpa"),
+            gather_idx=layout.gather_idx.unsqueeze(0),
+            target_ids=layout.target_ids.unsqueeze(0),
+            use_cache=False,
+        )
+
+        assert outputs["aux_loss"] is not None
+        assert torch.isfinite(outputs["aux_loss"])

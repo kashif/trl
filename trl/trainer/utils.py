@@ -1437,8 +1437,8 @@ def patch_chunked_lm_head(
 
     The patched forward computes the lm-head projection in chunks, so the full logits are never materialized. It
     selects the positions to score in one of two ways: by shifting the row by one and keeping the tokens flagged by
-    `completion_mask` (the default), or from explicit `gather_idx` / `target_ids` pairs passed as forward kwargs,
-    which is what layouts where the shift would pair the wrong tokens need.
+    `completion_mask` (the default), or from explicit `gather_idx` / `target_ids` pairs passed as forward kwargs, which
+    is what layouts where the shift would pair the wrong tokens need.
 
     Args:
         model (`torch.nn.Module`):
