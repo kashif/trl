@@ -14,8 +14,10 @@
 
 import pytest
 import torch
+from transformers import AutoModelForCausalLM
 
 from trl.experimental.zorro import build_zorro_mask, pack_shared_prefix_groups
+from trl.trainer.utils import patch_chunked_lm_head
 
 from ..testing_utils import TrlTestCase
 
@@ -262,3 +264,90 @@ class TestBuildZorroMask(TrlTestCase):
         layout = pack_shared_prefix_groups([[1, 2, 3]], [[0, 0, 1]], [0])
         with pytest.raises(ValueError, match="no mask builder"):
             build_zorro_mask(layout.segment_ids.unsqueeze(0), layout.branch_ids.unsqueeze(0), "flash_attention_2")
+
+
+class TestZorroEquivalence(TrlTestCase):
+    """Packed rollouts must train on exactly what the unpacked ones would."""
+
+    MODEL_ID = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+    CHUNK_SIZE = 16
+    TEMPERATURE = 0.7
+
+    def make_model(self):
+        model = AutoModelForCausalLM.from_pretrained(self.MODEL_ID, attn_implementation="sdpa", dtype=torch.float32)
+        patch_chunked_lm_head(model, chunk_size=self.CHUNK_SIZE, temperature=self.TEMPERATURE)
+        return model
+
+    @staticmethod
+    def unpacked_logprobs(model, input_ids, completion_mask):
+        """Run every sample on its own, the way training would without packing."""
+        logprobs = []
+        for tokens, mask in zip(input_ids, completion_mask, strict=True):
+            ids = torch.tensor([tokens])
+            outputs = model(input_ids=ids, labels=ids, completion_mask=torch.tensor([mask]), use_cache=False)
+            logprobs.append(outputs["log_probs"][0][torch.tensor(mask[1:]).bool()])
+        return torch.cat(logprobs)
+
+    @staticmethod
+    def packed_logprobs(model, layout):
+        """Run the whole group as one packed row with the ZoRRo mask."""
+        segment_ids, branch_ids = layout.segment_ids.unsqueeze(0), layout.branch_ids.unsqueeze(0)
+        outputs = model(
+            input_ids=layout.input_ids.unsqueeze(0),
+            position_ids=layout.position_ids.unsqueeze(0),
+            attention_mask=build_zorro_mask(segment_ids, branch_ids, "sdpa"),
+            gather_idx=layout.gather_idx.unsqueeze(0),
+            target_ids=layout.target_ids.unsqueeze(0),
+            use_cache=False,
+        )
+        return outputs["log_probs"][0]
+
+    def test_logprobs_match_the_unpacked_forward(self):
+        input_ids, completion_mask, group_ids = make_group(4, prompt_len=12, completion_len=6, group_id=0)
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+        model = self.make_model()
+
+        assert layout.dedup_ratio > 0.4  # the packing must actually be doing something
+
+        with torch.no_grad():
+            expected = self.unpacked_logprobs(model, input_ids, completion_mask)
+            actual = self.packed_logprobs(model, layout)
+
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+    def test_logprobs_match_with_mixed_groups_and_ragged_lengths(self):
+        first = make_group(3, prompt_len=9, completion_len=5, group_id=0)
+        second = make_group(2, prompt_len=7, completion_len=3, group_id=1, first_token=40)
+        lone = ([[60, 61, 62, 63]], [[0, 0, 1, 1]], [2])
+        input_ids = first[0] + second[0] + lone[0]
+        completion_mask = first[1] + second[1] + lone[1]
+        group_ids = first[2] + second[2] + lone[2]
+        # Ragged tails within a group: truncate one rollout of the first group.
+        input_ids[1] = input_ids[1][:-2]
+        completion_mask[1] = completion_mask[1][:-2]
+
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+        model = self.make_model()
+
+        with torch.no_grad():
+            expected = self.unpacked_logprobs(model, input_ids, completion_mask)
+            actual = self.packed_logprobs(model, layout)
+
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+    def test_gradients_match_the_unpacked_forward(self):
+        input_ids, completion_mask, group_ids = make_group(3, prompt_len=8, completion_len=4, group_id=0)
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+
+        unpacked_model = self.make_model()
+        self.unpacked_logprobs(unpacked_model, input_ids, completion_mask).sum().backward()
+
+        packed_model = self.make_model()
+        self.packed_logprobs(packed_model, layout).sum().backward()
+
+        unpacked_grads = dict(unpacked_model.named_parameters())
+        for name, param in packed_model.named_parameters():
+            reference = unpacked_grads[name].grad
+            assert (param.grad is None) == (reference is None), name
+            if param.grad is not None:
+                torch.testing.assert_close(param.grad, reference, atol=1e-4, rtol=1e-4, msg=f"grad mismatch: {name}")

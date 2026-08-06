@@ -1432,6 +1432,24 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
 def patch_chunked_lm_head(
     model: torch.nn.Module, chunk_size: int, temperature: float, output_router_logits: bool = False
 ) -> None:
+    """
+    Replace `model.forward` with one returning per-token log probabilities and entropies instead of logits.
+
+    The patched forward computes the lm-head projection in chunks, so the full logits are never materialized. It
+    selects the positions to score in one of two ways: by shifting the row by one and keeping the tokens flagged by
+    `completion_mask` (the default), or from explicit `gather_idx` / `target_ids` pairs passed as forward kwargs,
+    which is what layouts where the shift would pair the wrong tokens need.
+
+    Args:
+        model (`torch.nn.Module`):
+            Causal LM to patch, in place.
+        chunk_size (`int`):
+            Number of positions scored per chunk.
+        temperature (`float`):
+            Temperature the logits are divided by before the log-softmax.
+        output_router_logits (`bool`, *optional*, defaults to `False`):
+            Whether to request router logits and return the Mixture-of-Experts load-balancing auxiliary loss.
+    """
     final_logit_softcapping = getattr(model.config, "final_logit_softcapping", None)
 
     def _chunked_forward(
@@ -1440,10 +1458,15 @@ def patch_chunked_lm_head(
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         completion_mask: torch.Tensor | None = None,
+        gather_idx: torch.Tensor | None = None,
+        target_ids: torch.Tensor | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
-        assert labels is not None, "requires labels to not be None for logprob computation"
+        if gather_idx is None:
+            assert labels is not None, "requires labels to not be None for logprob computation"
+        elif target_ids is None:
+            raise ValueError("`gather_idx` requires `target_ids`, which holds the token each position predicts.")
 
         decoder_kwargs = {"output_router_logits": True} if output_router_logits else {}
         outputs = self.model(
@@ -1453,21 +1476,31 @@ def patch_chunked_lm_head(
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         hidden_states = outputs.last_hidden_state  # [B, S+1, H]
 
-        # Shift: predict next token
-        hidden_states = hidden_states[:, :-1, :]  # [B, S-1, H]
-        labels = labels[:, 1:]  # [B, S-1]
-
-        b, s, h = hidden_states.shape
-        hidden_flat = hidden_states.reshape(b * s, h)
-        targets_flat = labels.reshape(b * s)
-
-        # Filter to completion tokens only to avoid expensive matmuls on prompt tokens and tool results
         valid_mask = None
-        if completion_mask is not None:
-            completion_mask = completion_mask[:, 1:]  # same shift as labels
-            valid_mask = completion_mask.bool().reshape(b * s)
-            hidden_flat = hidden_flat[valid_mask]  # [N_valid, H]
-            targets_flat = targets_flat[valid_mask]  # [N_valid]
+        if gather_idx is not None:
+            # Explicit (position, target) pairs, used when the row is not a plain concatenation of sequences and the
+            # shift below would pair the wrong tokens -- e.g. a shared prefix, whose final position predicts the first
+            # token of every branch that follows it, not just the one it happens to sit next to.
+            b, s = gather_idx.shape
+            h = hidden_states.shape[-1]
+            batch_offsets = torch.arange(b, device=gather_idx.device).unsqueeze(1) * hidden_states.shape[1]
+            hidden_flat = hidden_states.reshape(-1, h)[(gather_idx + batch_offsets).reshape(-1)]
+            targets_flat = target_ids.reshape(-1)
+        else:
+            # Shift: predict next token
+            hidden_states = hidden_states[:, :-1, :]  # [B, S-1, H]
+            labels = labels[:, 1:]  # [B, S-1]
+
+            b, s, h = hidden_states.shape
+            hidden_flat = hidden_states.reshape(b * s, h)
+            targets_flat = labels.reshape(b * s)
+
+            # Filter to completion tokens only to avoid expensive matmuls on prompt tokens and tool results
+            if completion_mask is not None:
+                completion_mask = completion_mask[:, 1:]  # same shift as labels
+                valid_mask = completion_mask.bool().reshape(b * s)
+                hidden_flat = hidden_flat[valid_mask]  # [N_valid, H]
+                targets_flat = targets_flat[valid_mask]  # [N_valid]
 
         logprobs_valid, entropy_valid = _ChunkedLogProbFunction.apply(
             hidden_flat,
@@ -1509,8 +1542,12 @@ def patch_chunked_lm_head(
                     num_experts = self.config.num_experts
                 num_experts_per_tok = self.config.num_experts_per_tok
             # Padding-free packs all real tokens into a single row, so `attention_mask` is None and every token counts.
+            # With `gather_idx`, `attention_mask` is a prepared 4D mask rather than a padding mask, so drop it here.
             aux_loss = load_balancing_loss_func(
-                outputs.router_logits, num_experts, num_experts_per_tok, attention_mask
+                outputs.router_logits,
+                num_experts,
+                num_experts_per_tok,
+                None if gather_idx is not None else attention_mask,
             )
 
         return {
