@@ -52,6 +52,9 @@ class ZoRRoLayout:
         target_token_idx (`torch.Tensor`):
             Index of shape `(num_targets,)` into the sample's own token sequence, for gathering per-token fields such
             as old log probabilities.
+        sample_positions (`list[list[int]]`):
+            Packed position of every token of every sample, in token order. Sharing shows up here as several samples
+            listing the same positions for their prefix.
         num_tokens_unpacked (`int`):
             Number of tokens the same batch would occupy without prefix sharing, used to report the dedup ratio.
     """
@@ -64,6 +67,7 @@ class ZoRRoLayout:
     target_ids: torch.Tensor
     target_sample_idx: torch.Tensor
     target_token_idx: torch.Tensor
+    sample_positions: list[list[int]]
     num_tokens_unpacked: int
 
     @property
@@ -159,8 +163,8 @@ def pack_shared_prefix_groups(
     packed_positions: list[int] = []
     packed_segments: list[int] = []
     packed_branches: list[int] = []
-    # Packed position of every (sample, token) pair, needed to resolve the gather indices below.
-    packed_index_of: list[dict[int, int]] = [{} for _ in input_ids]
+    # Packed position of every token of every sample, needed to resolve the gather indices below.
+    sample_positions: list[list[int]] = [[] for _ in input_ids]
 
     segment = 0
     for members in buckets.values():
@@ -182,7 +186,7 @@ def pack_shared_prefix_groups(
                 packed_positions.extend(range(len(tokens)))
                 packed_segments.extend([segment] * len(tokens))
                 packed_branches.extend([0] * len(tokens))
-                packed_index_of[sample_idx] = {token_idx: start + token_idx for token_idx in range(len(tokens))}
+                sample_positions[sample_idx] = list(range(start, start + len(tokens)))
                 segment += 1
             continue
 
@@ -200,14 +204,13 @@ def pack_shared_prefix_groups(
             packed_positions.extend(range(prefix_len, len(tokens)))
             packed_segments.extend([segment] * len(tail))
             packed_branches.extend([branch] * len(tail))
-            packed_index_of[sample_idx] = {
-                **{token_idx: prefix_start + token_idx for token_idx in range(prefix_len)},
-                **{token_idx: tail_start + token_idx - prefix_len for token_idx in range(prefix_len, len(tokens))},
-            }
+            sample_positions[sample_idx] = list(range(prefix_start, prefix_start + prefix_len)) + list(
+                range(tail_start, tail_start + len(tail))
+            )
         segment += 1
 
-    # Targets: every trained token is predicted by the hidden state of the token before it. Resolving both ends
-    # through `packed_index_of` is what keeps a shared prefix correct -- its final hidden state predicts the first
+    # Targets: every trained token is predicted by the hidden state of the token before it. Resolving that position
+    # through `sample_positions` is what keeps a shared prefix correct -- its final hidden state predicts the first
     # token of *every* branch, which a global shift of the packed row would get wrong for all but the first branch.
     gather_idx: list[int] = []
     target_ids: list[int] = []
@@ -216,7 +219,7 @@ def pack_shared_prefix_groups(
     for sample_idx, (tokens, mask) in enumerate(zip(input_ids, completion_mask, strict=True)):
         for token_idx in range(1, len(tokens)):
             if mask[token_idx]:
-                gather_idx.append(packed_index_of[sample_idx][token_idx - 1])
+                gather_idx.append(sample_positions[sample_idx][token_idx - 1])
                 target_ids.append(tokens[token_idx])
                 target_sample_idx.append(sample_idx)
                 target_token_idx.append(token_idx)
@@ -230,5 +233,6 @@ def pack_shared_prefix_groups(
         target_ids=torch.tensor(target_ids, dtype=torch.long),
         target_sample_idx=torch.tensor(target_sample_idx, dtype=torch.long),
         target_token_idx=torch.tensor(target_token_idx, dtype=torch.long),
+        sample_positions=sample_positions,
         num_tokens_unpacked=sum(len(tokens) for tokens in input_ids),
     )

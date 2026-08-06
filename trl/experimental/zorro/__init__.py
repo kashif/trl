@@ -12,4 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .attention import build_zorro_mask, zorro_mask_function
 from .packing import ZoRRoLayout, pack_shared_prefix_groups

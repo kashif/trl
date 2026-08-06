@@ -13,10 +13,23 @@
 # limitations under the License.
 
 import pytest
+import torch
 
-from trl.experimental.zorro import pack_shared_prefix_groups
+from trl.experimental.zorro import build_zorro_mask, pack_shared_prefix_groups
 
 from ..testing_utils import TrlTestCase
+
+
+def make_group(num_rollouts, prompt_len, completion_len, group_id, first_token=0):
+    """A rollout group sharing one prompt, in the shape [`pack_shared_prefix_groups`] consumes."""
+    prompt = list(range(first_token, first_token + prompt_len))
+    input_ids, completion_mask, group_ids = [], [], []
+    for rollout in range(num_rollouts):
+        completion = [1000 + 100 * group_id + 10 * rollout + i for i in range(completion_len)]
+        input_ids.append(prompt + completion)
+        completion_mask.append([0] * prompt_len + [1] * completion_len)
+        group_ids.append(group_id)
+    return input_ids, completion_mask, group_ids
 
 
 def reference_targets(input_ids, completion_mask):
@@ -154,6 +167,98 @@ class TestPackSharedPrefixGroups(TrlTestCase):
         assert layout.target_sample_idx.tolist() == [0, 1, 2]
         assert layout.input_ids[layout.gather_idx].tolist() == [2, 4, 2]
 
+    def test_sample_positions_recover_every_sample(self):
+        input_ids = [[1, 2, 3, 40, 41], [1, 2, 3, 50], [7, 8, 70]]
+        layout = pack_shared_prefix_groups(
+            input_ids=input_ids,
+            completion_mask=[[0, 0, 0, 1, 1], [0, 0, 0, 1], [0, 0, 1]],
+            group_ids=[0, 0, 1],
+        )
+
+        for tokens, positions in zip(input_ids, layout.sample_positions, strict=True):
+            assert layout.input_ids[positions].tolist() == tokens
+            assert layout.position_ids[positions].tolist() == list(range(len(tokens)))
+
+    def test_dedup_drops_duplicate_prompts(self):
+        # Ported from the ZoRRo reference test suite (`tests/zorro_train/test_dedup.py::TestTokenSavings`): a batch of
+        # `num_groups` prompts rolled out `num_rollouts` times each keeps one prompt block per group plus every
+        # rollout's own completion.
+        num_groups, num_rollouts, prompt_len, completion_len = 2, 3, 16, 4
+        input_ids, completion_mask, group_ids = [], [], []
+        for group_id in range(num_groups):
+            group = make_group(num_rollouts, prompt_len, completion_len, group_id, first_token=100 * group_id)
+            input_ids += group[0]
+            completion_mask += group[1]
+            group_ids += group[2]
+
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+
+        assert layout.num_tokens == num_groups * prompt_len + num_groups * num_rollouts * completion_len
+        assert layout.num_tokens < layout.num_tokens_unpacked
+        assert layout.target_ids.numel() == num_groups * num_rollouts * completion_len
+
     def test_mismatched_input_lengths_raise(self):
         with pytest.raises(ValueError, match="must have the same length"):
             pack_shared_prefix_groups(input_ids=[[1, 2]], completion_mask=[[0, 1], [0, 1]], group_ids=[0, 0])
+
+
+class TestBuildZorroMask(TrlTestCase):
+    @staticmethod
+    def expected_mask(layout):
+        """Union of the per-rollout causal masks: each sample sees its own tokens, causally, and nothing else."""
+        mask = torch.zeros(layout.num_tokens, layout.num_tokens, dtype=torch.bool)
+        for positions in layout.sample_positions:
+            for query_rank, query in enumerate(positions):
+                mask[query, positions[: query_rank + 1]] = True
+        return mask
+
+    def test_sdpa_mask_matches_per_rollout_causal_masks(self):
+        input_ids, completion_mask, group_ids = make_group(3, prompt_len=5, completion_len=3, group_id=0)
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+
+        mask = build_zorro_mask(layout.segment_ids.unsqueeze(0), layout.branch_ids.unsqueeze(0), "sdpa")
+
+        assert mask.shape == (1, 1, layout.num_tokens, layout.num_tokens)
+        assert torch.equal(mask[0, 0], self.expected_mask(layout))
+
+    def test_siblings_never_attend_to_each_other(self):
+        input_ids, completion_mask, group_ids = make_group(2, prompt_len=3, completion_len=2, group_id=0)
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+
+        mask = build_zorro_mask(layout.segment_ids.unsqueeze(0), layout.branch_ids.unsqueeze(0), "sdpa")[0, 0]
+
+        branches = layout.branch_ids
+        first, second = (branches == 0).nonzero().flatten(), (branches == 1).nonzero().flatten()
+        assert not mask[second][:, first].any()
+        assert not mask[first][:, second].any()
+        # ... while both still read the whole shared prefix.
+        prefix = (branches == -1).nonzero().flatten()
+        assert mask[second][:, prefix].all()
+
+    def test_groups_are_isolated(self):
+        input_ids, completion_mask, group_ids = make_group(2, prompt_len=3, completion_len=2, group_id=0)
+        other = make_group(2, prompt_len=3, completion_len=2, group_id=1, first_token=50)
+        layout = pack_shared_prefix_groups(input_ids + other[0], completion_mask + other[1], group_ids + other[2])
+
+        mask = build_zorro_mask(layout.segment_ids.unsqueeze(0), layout.branch_ids.unsqueeze(0), "sdpa")[0, 0]
+
+        first, second = (layout.segment_ids == 0).nonzero().flatten(), (layout.segment_ids == 1).nonzero().flatten()
+        assert not mask[second][:, first].any()
+
+    def test_eager_mask_is_additive(self):
+        input_ids, completion_mask, group_ids = make_group(2, prompt_len=3, completion_len=2, group_id=0)
+        layout = pack_shared_prefix_groups(input_ids, completion_mask, group_ids)
+
+        mask = build_zorro_mask(
+            layout.segment_ids.unsqueeze(0), layout.branch_ids.unsqueeze(0), "eager", dtype=torch.float32
+        )
+
+        allowed = self.expected_mask(layout)
+        assert mask.dtype == torch.float32
+        assert torch.equal(mask[0, 0] == 0, allowed)
+        assert (mask[0, 0][~allowed] == torch.finfo(torch.float32).min).all()
+
+    def test_unsupported_attn_implementation_raises(self):
+        layout = pack_shared_prefix_groups([[1, 2, 3]], [[0, 0, 1]], [0])
+        with pytest.raises(ValueError, match="no mask builder"):
+            build_zorro_mask(layout.segment_ids.unsqueeze(0), layout.branch_ids.unsqueeze(0), "flash_attention_2")
