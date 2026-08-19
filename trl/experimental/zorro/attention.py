@@ -26,6 +26,11 @@ from transformers.masking_utils import (
 )
 
 
+# Attention implementations that accept a prepared mask, and can therefore run the packed layout. FlashAttention is
+# excluded on purpose: it takes no mask, so the shared-prefix pattern would silently degrade to plain causal.
+SUPPORTED_ATTN_IMPLEMENTATIONS = ("sdpa", "eager", "flex_attention")
+
+
 def zorro_mask_function(segment_ids: torch.Tensor, branch_ids: torch.Tensor) -> Callable:
     """
     Mask function for a batch packed by [`pack_shared_prefix_groups`].

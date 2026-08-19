@@ -924,3 +924,54 @@ class TestZorroSupportChecks(TrlTestCase):
         # layers would apply the full-attention ZoRRo mask as their own and read past their window, with no error.
         with pytest.raises(ValueError, match="full attention"):
             self._build("trl-internal-testing/tiny-Gemma2ForCausalLM", zorro=True)
+
+    def test_train_with_zorro(self):
+        # The whole loop under ZoRRo: group-aware planning, prefix packing, the two-axis padding surviving the
+        # dataloader scatter, and the packed forward in `compute_loss`. Runs on SDPA, so no GPU is needed.
+        model_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_completion", split="train")
+
+        training_args = AsyncGRPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,
+            per_device_train_batch_size=3,
+            num_generations=3,
+            max_completion_length=8,
+            token_budget=256,
+            vllm_server_timeout=5.0,
+            report_to="none",
+            max_steps=2,  # this runs on CPU, so keep it to a couple of optimizer steps
+            zorro=True,
+        )
+        trainer = AsyncGRPOTrainer(
+            model=model_id,
+            reward_funcs=dummy_reward_func,
+            args=training_args,
+            train_dataset=dataset,
+            rollout_worker=_StubRolloutWorker(AutoTokenizer.from_pretrained(model_id), dataset, num_generations=3),
+            weight_transfer=_StubWeightTransfer(),
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        for n, param in previous_trainable_params.items():
+            assert not torch.equal(param, trainer.model.get_parameter(n)), f"Parameter {n} has not changed."
+        # The rollouts of a prompt reach the same rank, so the shared prompt is actually deduplicated.
+        assert max(trainer._metrics["train"]["zorro/dedup_ratio"], default=0.0) > 0.0
+
+    def test_rejects_attn_implementation_without_mask_support(self):
+        with pytest.raises(ValueError, match="cannot run the packed layout"):
+            AsyncGRPOTrainer(
+                model="trl-internal-testing/tiny-Qwen3ForCausalLM",
+                args=AsyncGRPOConfig(
+                    output_dir=self.tmp_dir, zorro=True, zorro_attn_implementation="flash_attention_2"
+                ),
+                reward_funcs=dummy_reward_func,
+                train_dataset=load_dataset(
+                    "trl-internal-testing/zen", "conversational_prompt_completion", split="train"
+                ),
+                weight_transfer=_StubWeightTransfer(),
+            )

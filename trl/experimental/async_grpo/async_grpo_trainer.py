@@ -35,7 +35,7 @@ from transformers.data.data_collator import DataCollatorMixin
 
 from ...trainer.base_trainer import _BaseTrainer
 from ...trainer.utils import get_config_model_id, is_trackio_available, nanmax, nanmin, pad, patch_chunked_lm_head
-from ..zorro import build_zorro_mask, pack_shared_prefix_groups
+from ..zorro import SUPPORTED_ATTN_IMPLEMENTATIONS, build_zorro_mask, pack_shared_prefix_groups
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutWorker, RolloutSample
 from .vllm_client import VLLMClient
@@ -783,7 +783,12 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # ZoRRo is the exception: its rows are not a plain concatenation, so the layout has to be expressed as an
         # attention mask -- which FlashAttention does not take.
         self.zorro = args.zorro
-        attn_implementation = "sdpa" if self.zorro else "kernels-community/flash-attn3"
+        if self.zorro and args.zorro_attn_implementation not in SUPPORTED_ATTN_IMPLEMENTATIONS:
+            raise ValueError(
+                f"`zorro_attn_implementation='{args.zorro_attn_implementation}'` cannot run the packed layout. "
+                f"Expected one of {list(SUPPORTED_ATTN_IMPLEMENTATIONS)}; FlashAttention takes no attention mask."
+            )
+        attn_implementation = args.zorro_attn_implementation if self.zorro else "kernels-community/flash-attn3"
         model = AutoModelForCausalLM.from_pretrained(
             model,
             device_map=None,

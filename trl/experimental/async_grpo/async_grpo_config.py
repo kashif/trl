@@ -136,6 +136,11 @@ class AsyncGRPOConfig(_BaseConfig):
             the same prompt are packed as a shared prefix followed by each rollout's own tokens, which cuts both the
             tokens the model runs over and the quadratic attention cost. The training objective is unchanged.
             Requires an attention implementation that accepts an attention mask.
+        zorro_attn_implementation (`str`, *optional*, defaults to `"sdpa"`):
+            Attention implementation to use when `zorro` is `True`. Must accept a prepared attention mask, so
+            FlashAttention is not an option. `"flex_attention"` turns the packed layout into a block-sparse mask and
+            is the faster choice, but it needs an accelerator: it has no CPU or MPS backward. `"sdpa"` materializes
+            the mask, which costs memory quadratic in the packed length.
         zorro_min_group_size (`int`, *optional*, defaults to `2`):
             Minimum number of rollouts sharing a prompt before their prompt is deduplicated.
         zorro_min_prefix_length (`int`, *optional*, defaults to `0`):
@@ -377,6 +382,15 @@ class AsyncGRPOConfig(_BaseConfig):
             "Rollouts sampled from the same prompt are packed as a shared prefix followed by each rollout's own "
             "tokens, which cuts both the tokens the model runs over and the quadratic attention cost. The training "
             "objective is unchanged. Requires an attention implementation that accepts an attention mask."
+        },
+    )
+    zorro_attn_implementation: str = field(
+        default="sdpa",
+        metadata={
+            "help": "Attention implementation to use when `zorro` is `True`. Must accept a prepared attention mask, "
+            "so FlashAttention is not an option. `'flex_attention'` turns the packed layout into a block-sparse mask "
+            "and is the faster choice, but it needs an accelerator: it has no CPU or MPS backward. `'sdpa'` "
+            "materializes the mask, which costs memory quadratic in the packed length."
         },
     )
     zorro_min_group_size: int = field(
