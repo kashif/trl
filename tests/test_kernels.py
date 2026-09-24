@@ -107,6 +107,52 @@ class TestChunkedLogProbFunction:
     N, H, V = 64, 32, 128
     CHUNK_SIZE = 32
 
+    @pytest.mark.parametrize("clip_max", [None, 2.0])
+    @pytest.mark.parametrize("softcap", [None, 4.0])
+    def test_score_centering_head_gradient(self, clip_max, softcap):
+        torch.manual_seed(42)
+        hidden = torch.randn(7, 5, device=torch_device, requires_grad=True)
+        weight = torch.randn(23, 5, device=torch_device, requires_grad=True)
+        labels = torch.randint(0, 23, (7,), device=torch_device)
+        head_ids = torch.rand(7, 23, device=torch_device).argsort(dim=-1)[:, :4]
+        sampler_log_probs = torch.randn(7, 23, device=torch_device).log_softmax(-1)
+        q = sampler_log_probs.gather(-1, head_ids).exp()
+        sampled_q = sampler_log_probs.gather(-1, labels[:, None]).squeeze(-1)
+        advantages = torch.randn(7, device=torch_device)
+
+        def centered_loss(sampled, head):
+            with torch.no_grad():
+                p = head.exp()
+                rho = (1 - q.sum(-1)).clamp_min(1e-6) / (1 - p.sum(-1)).clamp_min(1e-6)
+                sampled_weight = (
+                    torch.ones_like(sampled) if clip_max is None else (sampled - sampled_q).exp().clamp(max=clip_max)
+                )
+                coefficients = (
+                    q - rho[:, None] * p
+                    if clip_max is None
+                    else torch.minimum(p, clip_max * q) - (clip_max * rho).clamp(max=1)[:, None] * p
+                )
+            return (-advantages * (sampled_weight * sampled - (coefficients * head).sum(-1))).sum()
+
+        sampled, _, head = ChunkedLogProbFunction.apply(hidden, weight, None, labels, 0.7, 8, softcap, 1.0, head_ids)
+        loss = centered_loss(sampled, head)
+        loss.backward()
+
+        hidden_ref = hidden.detach().clone().requires_grad_()
+        weight_ref = weight.detach().clone().requires_grad_()
+        logits = hidden_ref @ weight_ref.T
+        if softcap is not None:
+            logits = softcap * torch.tanh(logits / softcap)
+        log_probs = (logits / 0.7).log_softmax(-1)
+        selected = log_probs.gather(-1, labels[:, None]).squeeze(-1)
+        head_ref = log_probs.gather(-1, head_ids)
+        ref_loss = centered_loss(selected, head_ref)
+        ref_loss.backward()
+
+        torch.testing.assert_close(head, head_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(hidden.grad, hidden_ref.grad, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-4)
+
     def _reference_logprobs_and_entropy(
         self, hidden, weight, labels, temperature, bias=None, logit_scale=1.0, final_logit_softcapping=None
     ):

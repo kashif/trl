@@ -16,6 +16,7 @@ import asyncio
 import enum
 import functools
 import inspect
+import math
 import multiprocessing as mp
 import os
 import pickle
@@ -66,6 +67,8 @@ class TurnRecord:
     prompt_ids: list[int]
     output_ids: list[int]
     output_log_probs: list[float] = field(default_factory=list)
+    score_centering_ids: list[list[int]] = field(default_factory=list)
+    score_centering_log_probs: list[list[float]] = field(default_factory=list)
 
 
 @dataclass
@@ -76,6 +79,8 @@ class TrainingSequence:
     completion_mask: list[int]  # 1 = train this token, 0 = context
     old_log_probs: list[float]  # generator logprobs, 0.0 where mask is 0
     rollout_id: RolloutId  # which conversation this row came from
+    score_centering_ids: list[list[int]] = field(default_factory=list)
+    score_centering_log_probs: list[list[float]] = field(default_factory=list)
 
 
 def _common_prefix_len(a: list[int], b: list[int], chunk: int = 4096) -> int:
@@ -105,6 +110,8 @@ class _SampleBuilder:
         self.tokens: list[int] = []
         self.loss_mask: list[int] = []
         self.logprobs: list[float] = []
+        self.score_centering_ids: list[list[int]] = []
+        self.score_centering_log_probs: list[list[float]] = []
         self.last_response_start_idx: int | None = None
 
     def classify_token_drift(self, turn: TurnRecord) -> tuple[DriftKind, int]:
@@ -126,10 +133,16 @@ class _SampleBuilder:
             self._append(turn.prompt_ids[len(self.tokens) :], mask=0)
         self.last_response_start_idx = len(self.tokens)
         self._append(turn.output_ids, mask=1, logprobs=turn.output_log_probs)
+        self.score_centering_ids.extend(turn.score_centering_ids)
+        self.score_centering_log_probs.extend(turn.score_centering_log_probs)
 
     def _align_to_prompt(self, prompt_ids: list[int]) -> None:
         matched = _common_prefix_len(self.tokens, prompt_ids)
         tail = prompt_ids[matched:]
+        removed = sum(self.loss_mask[matched:])
+        if removed:
+            del self.score_centering_ids[-removed:]
+            del self.score_centering_log_probs[-removed:]
         self.tokens[matched:] = tail
         self.loss_mask[matched:] = [0] * len(tail)
         self.logprobs[matched:] = [0.0] * len(tail)
@@ -143,7 +156,14 @@ class _SampleBuilder:
         return any(self.loss_mask)
 
     def to_training_sequence(self, rollout_id: RolloutId) -> TrainingSequence:
-        return TrainingSequence(list(self.tokens), list(self.loss_mask), list(self.logprobs), rollout_id)
+        return TrainingSequence(
+            list(self.tokens),
+            list(self.loss_mask),
+            list(self.logprobs),
+            rollout_id,
+            list(self.score_centering_ids),
+            list(self.score_centering_log_probs),
+        )
 
 
 def _chain_to_sequences(
@@ -203,6 +223,8 @@ class RolloutSample:
     model_version: int
     group_id: int
     metrics: dict[str, float]
+    score_centering_ids: list[list[int]] = field(default_factory=list)
+    score_centering_log_probs: list[list[float]] = field(default_factory=list)
     enqueued_at: float | None = None
 
 
@@ -294,6 +316,7 @@ class _AsyncRolloutLoop:
 
     # Class attribute: declares that this loop produces its own per-rollout reward
     _provides_rollout_reward: bool = False
+    score_centering_top_k: int = 0
 
     def __init__(
         self,
@@ -322,6 +345,7 @@ class _AsyncRolloutLoop:
         top_k: int = 0,
         min_p: float | None = None,
         repetition_penalty: float = 1.0,
+        score_centering_top_k: int = 0,
         request_timeout: int = 120,
         chat_template_kwargs: dict[str, Any] | None = None,
         max_tool_calling_iterations: int | None = None,
@@ -376,6 +400,7 @@ class _AsyncRolloutLoop:
         self.top_k = top_k
         self.min_p = min_p
         self.repetition_penalty = repetition_penalty
+        self.score_centering_top_k = score_centering_top_k
         self.request_timeout = request_timeout
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.max_tool_calling_iterations = max_tool_calling_iterations
@@ -887,12 +912,17 @@ class _AsyncRolloutLoop:
                 chat_template=self.chat_template,
                 **self.chat_template_kwargs,
             )
-            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
+            turn = await self._generate_one_turn(prompt_ids)
+            if self.score_centering_top_k:
+                turn_ids, turn_logprobs, head_ids, head_logprobs = turn
+            else:
+                turn_ids, turn_logprobs = turn
+                head_ids, head_logprobs = [], []
             assistant_message = parse_response(self.tokenizer, turn_ids, prefix=prompt_ids)
             completion.append(assistant_message)
             completion_ids.extend(turn_ids)
             messages.append(assistant_message)
-            turns.append(TurnRecord(prompt_ids, turn_ids, turn_logprobs))
+            turns.append(TurnRecord(prompt_ids, turn_ids, turn_logprobs, head_ids, head_logprobs))
             tool_calls = assistant_message.get("tool_calls")
             if tool_calls is None:
                 break
@@ -974,6 +1004,9 @@ class _AsyncRolloutLoop:
             "return_token_ids": True,
             "logprobs": 0,
         }
+        if self.score_centering_top_k:
+            payload["logprobs"] = self.score_centering_top_k
+            payload["return_tokens_as_token_ids"] = True
         if self.min_p is not None:
             payload["min_p"] = self.min_p
         output = await self._retry(
@@ -982,7 +1015,31 @@ class _AsyncRolloutLoop:
             label="vllm /v1/completions",
         )
         choice = output["choices"][0]
-        return choice["token_ids"], choice["logprobs"]["token_logprobs"]
+        token_ids = choice["token_ids"]
+        token_logprobs = choice["logprobs"]["token_logprobs"]
+        if not self.score_centering_top_k:
+            return token_ids, token_logprobs
+
+        top_logprobs = choice["logprobs"]["top_logprobs"]
+        if len(top_logprobs) != len(token_ids) or len(token_logprobs) != len(token_ids):
+            raise ValueError("Score centering requires sampler logprobs for every generated token.")
+        head_ids, head_logprobs = [], []
+        for step in top_logprobs:
+            # vLLM includes the sampled token in addition to the requested top-k entries.
+            head = sorted(
+                ((int(key.removeprefix("token_id:")), value) for key, value in step.items()), key=lambda x: -x[1]
+            )
+            head = head[: self.score_centering_top_k]
+            if (
+                len(head) != self.score_centering_top_k
+                or len({token_id for token_id, _ in head}) != len(head)
+                or any(not math.isfinite(logp) or logp > 0 for _, logp in head)
+                or sum(math.exp(logp) for _, logp in head) > 1.0001
+            ):
+                raise ValueError("Invalid sampler top-k logprobs for score centering.")
+            head_ids.append([token_id for token_id, _ in head])
+            head_logprobs.append([logp for _, logp in head])
+        return token_ids, token_logprobs, head_ids, head_logprobs
 
     async def _score_group(self, group: RolloutGroup) -> list[RolloutSample]:
         kwargs = dict(
@@ -1076,6 +1133,8 @@ class _AsyncRolloutLoop:
                         input_ids=seq.input_ids,
                         completion_mask=seq.completion_mask,
                         old_log_probs=seq.old_log_probs,
+                        score_centering_ids=seq.score_centering_ids,
+                        score_centering_log_probs=seq.score_centering_log_probs,
                         advantage=float(advantage),
                         model_version=group.model_version,
                         group_id=group.group_id,

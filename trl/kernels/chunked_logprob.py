@@ -56,12 +56,17 @@ def _forward_kernel(
     sum_exp_ptr,
     x_sum_exp_ptr,
     target_logit_ptr,
+    head_ids_ptr,
+    head_logits_ptr,
     vocab_start,
     n_cols,
+    head_width,
     logit_scale,
     softcap,
     inv_t,
     HAS_SOFTCAP: tl.constexpr,
+    HAS_HEAD: tl.constexpr,
+    HEAD_BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # One program per token: fold one vocabulary chunk of its logits into the running online-logsumexp statistics
@@ -90,6 +95,17 @@ def _forward_kernel(
     if (local >= 0) & (local < n_cols):
         z = tl.load(row_ptr + local).to(tl.float32)
         tl.store(target_logit_ptr + row, _transform(z, logit_scale, softcap, inv_t, HAS_SOFTCAP))
+    if HAS_HEAD:
+        offsets = tl.arange(0, HEAD_BLOCK_SIZE)
+        valid = offsets < head_width
+        head_local = tl.load(head_ids_ptr + row * head_width + offsets, mask=valid, other=-1) - vocab_start
+        in_chunk = valid & (head_local >= 0) & (head_local < n_cols)
+        z = tl.load(row_ptr + head_local, mask=in_chunk, other=0.0).to(tl.float32)
+        tl.store(
+            head_logits_ptr + row * head_width + offsets,
+            _transform(z, logit_scale, softcap, inv_t, HAS_SOFTCAP),
+            mask=in_chunk,
+        )
 
 
 @triton.jit
@@ -101,6 +117,7 @@ def _backward_kernel(
     entropy_ptr,
     grad_logprobs_ptr,
     grad_entropy_ptr,
+    grad_head_sum_ptr,
     vocab_start,
     n_cols,
     logit_scale,
@@ -109,6 +126,7 @@ def _backward_kernel(
     HAS_SOFTCAP: tl.constexpr,
     HAS_LOGPROB_GRAD: tl.constexpr,
     HAS_ENTROPY_GRAD: tl.constexpr,
+    HAS_HEAD_GRAD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # Overwrite one block of the logits tile with the gradient of the loss with respect to the projection output
@@ -131,6 +149,8 @@ def _backward_kernel(
         g = tl.load(grad_logprobs_ptr + row)
         is_target = (offsets + vocab_start) == tl.load(targets_ptr + row)
         grad += g * (is_target.to(tl.float32) - p)
+    if HAS_HEAD_GRAD:
+        grad -= tl.load(grad_head_sum_ptr + row) * p
     if HAS_ENTROPY_GRAD:
         # d(entropy) / dz_j = -p_j * (log p_j + entropy)
         g = tl.load(grad_entropy_ptr + row)
@@ -162,13 +182,16 @@ class ChunkedLogProbFunction(torch.autograd.Function):
         chunk_size: int,
         final_logit_softcapping: float | None = None,
         logit_scale: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        head_ids: torch.Tensor | None = None,  # [N, K]
+    ) -> tuple[torch.Tensor, ...]:
         # entropy is often computed for logging only (no grad required); without this, autograd would
         # materialize its incoming gradient as zeros and backward would waste compute on a no-op term
         ctx.set_materialize_grads(False)
         device = hidden.device
         N = hidden.shape[0]
         vocab = weight.shape[0]
+        if head_ids is not None:
+            head_ids = head_ids.contiguous()
         compute_dtype = (
             torch.get_autocast_dtype(device.type) if torch.is_autocast_enabled(device.type) else hidden.dtype
         )
@@ -183,6 +206,7 @@ class ChunkedLogProbFunction(torch.autograd.Function):
         sum_exp = torch.zeros((N,), device=device, dtype=torch.float32)
         x_sum_exp = torch.zeros((N,), device=device, dtype=torch.float32)
         target_logit = torch.zeros((N,), device=device, dtype=torch.float32)
+        head_logits = torch.empty(head_ids.shape, device=device, dtype=torch.float32) if head_ids is not None else None
         mm_buf = torch.empty((min(N, TOKEN_CHUNK_SIZE), chunk_size), device=device, dtype=compute_dtype)
 
         for token_start in range(0, N, TOKEN_CHUNK_SIZE):
@@ -203,8 +227,15 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                     sum_exp[token_start:token_end],
                     x_sum_exp[token_start:token_end],
                     target_logit[token_start:token_end],
+                    head_ids[token_start:token_end] if head_ids is not None else targets[token_start:token_end],
+                    head_logits[token_start:token_end]
+                    if head_logits is not None
+                    else target_logit[token_start:token_end],
                     start,
                     end - start,
+                    head_ids.shape[1] if head_ids is not None else 0,
+                    HAS_HEAD=head_ids is not None,
+                    HEAD_BLOCK_SIZE=triton.next_power_of_2(head_ids.shape[1]) if head_ids is not None else 1,
                     BLOCK_SIZE=_BLOCK_SIZE,
                     **kernel_args,
                 )
@@ -212,19 +243,27 @@ class ChunkedLogProbFunction(torch.autograd.Function):
         log_z = running_max + torch.log(sum_exp)
         logprobs = target_logit - log_z
         entropy = log_z - x_sum_exp / sum_exp
+        head_logprobs = head_logits - log_z[:, None] if head_logits is not None else None
 
-        ctx.save_for_backward(hidden, weight, bias, targets, log_z, entropy)
+        ctx.save_for_backward(hidden, weight, bias, targets, log_z, entropy, head_ids, head_logprobs)
         ctx.compute_dtype = compute_dtype
         ctx.chunk_size = chunk_size
         ctx.kernel_args = kernel_args
-        return logprobs, entropy
+        if head_logprobs is None:
+            return logprobs, entropy
+        return logprobs, entropy, head_logprobs
 
     @staticmethod
-    def backward(ctx, grad_logprobs: torch.Tensor | None, grad_entropy: torch.Tensor | None):  # type: ignore
+    def backward(
+        ctx,
+        grad_logprobs: torch.Tensor | None,
+        grad_entropy: torch.Tensor | None,
+        grad_head_logprobs: torch.Tensor | None = None,
+    ):  # type: ignore
         # `trl.trainer.utils` imports this module, so import from it at call time
         from ..trainer.utils import maybe_gather_lm_head_ctx
 
-        hidden, weight, bias, targets, log_z, entropy = ctx.saved_tensors
+        hidden, weight, bias, targets, log_z, entropy, head_ids, head_logprobs = ctx.saved_tensors
         compute_dtype = ctx.compute_dtype
         chunk_size = ctx.chunk_size
         needs_hidden_grad, needs_weight_grad, needs_bias_grad = ctx.needs_input_grad[:3]
@@ -242,11 +281,25 @@ class ChunkedLogProbFunction(torch.autograd.Function):
             mm_buf = torch.empty((min(N, TOKEN_CHUNK_SIZE), chunk_size), device=hidden.device, dtype=compute_dtype)
             grad_logprobs = grad_logprobs.float().contiguous() if grad_logprobs is not None else None
             grad_entropy = grad_entropy.float().contiguous() if grad_entropy is not None else None
+            grad_head = grad_head_logprobs.float().contiguous() if grad_head_logprobs is not None else None
+            grad_head_sum = grad_head.sum(-1).contiguous() if grad_head is not None else None
 
             for token_start in range(0, N, TOKEN_CHUNK_SIZE):
                 token_end = min(token_start + TOKEN_CHUNK_SIZE, N)
                 n = token_end - token_start
                 hidden_chunk = hidden[token_start:token_end].to(compute_dtype)
+                if grad_head is not None:
+                    head_ids_chunk = head_ids[token_start:token_end]
+                    head_direct = (
+                        grad_head[token_start:token_end] * ctx.kernel_args["inv_t"] * ctx.kernel_args["logit_scale"]
+                    )
+                    if ctx.kernel_args["HAS_SOFTCAP"]:
+                        tanh_value = (
+                            (head_logprobs[token_start:token_end] + log_z[token_start:token_end, None])
+                            / ctx.kernel_args["inv_t"]
+                            / ctx.kernel_args["softcap"]
+                        )
+                        head_direct = head_direct * (1 - tanh_value.square())
                 for start in range(0, vocab, chunk_size):
                     end = min(start + chunk_size, vocab)
                     w_chunk = weight[start:end].to(compute_dtype)
@@ -262,13 +315,19 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                         entropy[token_start:token_end],
                         grad_logprobs[token_start:token_end] if grad_logprobs is not None else log_z,
                         grad_entropy[token_start:token_end] if grad_entropy is not None else log_z,
+                        grad_head_sum[token_start:token_end] if grad_head_sum is not None else log_z,
                         start,
                         end - start,
                         HAS_LOGPROB_GRAD=grad_logprobs is not None,
                         HAS_ENTROPY_GRAD=grad_entropy is not None,
+                        HAS_HEAD_GRAD=grad_head is not None,
                         BLOCK_SIZE=_BLOCK_SIZE,
                         **ctx.kernel_args,
                     )
+                    if grad_head is not None:
+                        in_chunk = (head_ids_chunk >= start) & (head_ids_chunk < end)
+                        local_ids = (head_ids_chunk - start).clamp(0, end - start - 1)
+                        tile.scatter_add_(1, local_ids, (head_direct * in_chunk).to(tile.dtype))
                     if grad_hidden is not None:
                         _addmm_fp32(grad_hidden[token_start:token_end], tile, w_chunk)
                     if grad_weight is not None:
@@ -276,7 +335,7 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                     if grad_bias is not None:
                         grad_bias[start:end] += tile.sum(dim=0, dtype=torch.float32)
 
-        return (
+        gradients = (
             grad_hidden.to(hidden.dtype) if grad_hidden is not None else None,
             grad_weight.to(weight.dtype) if grad_weight is not None else None,
             grad_bias.to(bias.dtype) if grad_bias is not None else None,
@@ -285,4 +344,6 @@ class ChunkedLogProbFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
+        return gradients[: len(ctx.needs_input_grad)]

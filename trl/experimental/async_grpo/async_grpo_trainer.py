@@ -395,6 +395,8 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                 "input_ids": sample.input_ids,
                 "completion_mask": sample.completion_mask,
                 "old_log_probs": sample.old_log_probs,
+                "score_centering_ids": sample.score_centering_ids,
+                "score_centering_log_probs": sample.score_centering_log_probs,
                 "advantage": sample.advantage,
                 "group_id": sample.group_id,
                 "metrics": sample.metrics,  # per-sample rewards; aggregated by the collator, never sent to the model
@@ -551,6 +553,7 @@ class DataCollatorForRollout(DataCollatorMixin):
     metrics: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     # Per-row token cap of the planner,
     token_budget: int = 0
+    score_centering_top_k: int = 0
 
     def torch_call(self, examples: list[Any]) -> dict[str, Any]:
         # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into `num_processes`
@@ -558,6 +561,7 @@ class DataCollatorForRollout(DataCollatorMixin):
         (groups,) = examples
 
         input_ids, attention_mask, completion_mask, old_log_probs, position_ids, advantages = [], [], [], [], [], []
+        score_centering_ids, score_centering_log_probs = [], []
         for group in groups:
             seq_lengths = [len(example["input_ids"]) for example in group]
             ids = [token for example in group for token in example["input_ids"]]
@@ -575,6 +579,23 @@ class DataCollatorForRollout(DataCollatorMixin):
                     [torch.full((n,), example["advantage"]) for example, n in zip(group, seq_lengths, strict=False)]
                 )
             )
+            if self.score_centering_top_k:
+                for example in group:
+                    if len(example["score_centering_ids"]) != sum(example["completion_mask"]) or len(
+                        example["score_centering_log_probs"]
+                    ) != len(example["score_centering_ids"]):
+                        raise ValueError("Score centering requires sampler top-k data for every completion token.")
+                score_centering_ids.append(
+                    torch.tensor(
+                        [head for example in group for head in example["score_centering_ids"]], dtype=torch.long
+                    ).reshape(-1, self.score_centering_top_k)
+                )
+                score_centering_log_probs.append(
+                    torch.tensor(
+                        [head for example in group for head in example["score_centering_log_probs"]],
+                        dtype=torch.float32,
+                    ).reshape(-1, self.score_centering_top_k)
+                )
 
         input_ids = pad(input_ids, padding_value=self.pad_token_id)
         attention_mask = pad(attention_mask, padding_value=0)
@@ -599,7 +620,7 @@ class DataCollatorForRollout(DataCollatorMixin):
 
         self._log_metrics(groups=groups, all_examples=all_examples, padded=attention_mask)
 
-        return {
+        batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "completion_mask": completion_mask,
@@ -610,6 +631,10 @@ class DataCollatorForRollout(DataCollatorMixin):
             "global_n_forward_tokens": global_n_forward_tokens,
             "mean_seq_len": mean_seq_len_t,
         }
+        if self.score_centering_top_k:
+            batch["score_centering_ids"] = pad(score_centering_ids, padding_value=0)
+            batch["score_centering_log_probs"] = pad(score_centering_log_probs, padding_value=0.0)
+        return batch
 
     def _log_metrics(
         self, groups: list[list[dict[str, Any]]], all_examples: list[dict[str, Any]], padded: torch.Tensor
@@ -1062,6 +1087,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         self.temperature = args.temperature
+        self.score_centering = args.score_centering
+        self.score_centering_importance_sampling_clip_max = args.score_centering_importance_sampling_clip_max
+        if self.score_centering and rollout_worker is not None:
+            raise ValueError("Score centering requires the default rollout worker to collect sampler top-k logprobs.")
 
         # Model
         model_init_kwargs = args.model_init_kwargs or {}
@@ -1330,6 +1359,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     top_k=self.args.top_k,
                     min_p=self.args.min_p,
                     repetition_penalty=self.args.repetition_penalty,
+                    score_centering_top_k=self.args.score_centering_top_k if self.score_centering else 0,
                     request_timeout=self.args.request_timeout,
                     chat_template_kwargs=self.args.chat_template_kwargs,
                     max_tool_calling_iterations=self.args.max_tool_calling_iterations,
@@ -1417,6 +1447,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
                     # construct the collator (and never use it) while `token_budget` is still `None`.
                     token_budget=max(self.args.token_budget or 0, 0),
+                    score_centering_top_k=self.args.score_centering_top_k if self.score_centering else 0,
                 ),
                 num_workers=0,
                 # NOTE(@aminediro):
@@ -1441,6 +1472,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "global_n_tokens",
                 "global_n_forward_tokens",
                 "mean_seq_len",
+                "score_centering_ids",
+                "score_centering_log_probs",
             ]
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1454,6 +1487,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
         old_log_probs = inputs["old_log_probs"][mask_bool].unsqueeze(0)
         position_ids = inputs["position_ids"][mask_bool].unsqueeze(0)
         advantages = inputs["advantages"][mask_bool].unsqueeze(0)
+        score_centering_ids = None
+        if self.score_centering:
+            n_completion_tokens = int(completion_mask.sum())
+            score_centering_ids = inputs["score_centering_ids"][:, :n_completion_tokens]
+            sampler_head_log_probs = inputs["score_centering_log_probs"][:, :n_completion_tokens]
 
         forward_start = time.time()
         # MoE models: request router logits so the forward returns the load-balancing loss
@@ -1463,6 +1501,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
             position_ids=position_ids,
             labels=input_ids.masked_fill(completion_mask == 0, -100),
             fused_lm_head=True,
+            score_centering_ids=score_centering_ids,
             **router_kwargs,
         )
         log_probs, entropy = outputs.log_probs, outputs.entropy
@@ -1473,10 +1512,33 @@ class AsyncGRPOTrainer(_BaseTrainer):
         advantages = advantages[:, 1:]
         log_ratio = log_probs - old_log_probs
         coef_1 = torch.exp(log_ratio)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_token_loss1 = coef_1 * advantages
-        per_token_loss2 = coef_2 * advantages
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        if self.score_centering:
+            valid_mask = completion_mask.bool()
+            train_head_log_probs = outputs.score_centering_log_probs
+            sampler_head_log_probs = sampler_head_log_probs.reshape_as(train_head_log_probs)
+            with torch.no_grad():
+                train_head_probs = train_head_log_probs.float().exp()
+                sampler_head_probs = sampler_head_log_probs.float().exp()
+                rho = (1 - sampler_head_probs.sum(-1)).clamp_min(1e-6) / (1 - train_head_probs.sum(-1)).clamp_min(1e-6)
+                if self.score_centering_importance_sampling_clip_max is None:
+                    sampled_weight = torch.ones_like(log_probs[valid_mask])
+                    head_coefficients = sampler_head_probs - rho.unsqueeze(-1) * train_head_probs
+                else:
+                    clip_max = self.score_centering_importance_sampling_clip_max
+                    sampled_weight = log_ratio[valid_mask].clamp(max=math.log(clip_max)).exp()
+                    weighted_sampler_head_probs = torch.minimum(train_head_probs, clip_max * sampler_head_probs)
+                    alpha = (clip_max * rho).clamp(max=1)
+                    head_coefficients = weighted_sampler_head_probs - alpha.unsqueeze(-1) * train_head_probs
+            correction = (head_coefficients * train_head_log_probs).sum(-1)
+            per_token_loss = torch.zeros_like(log_probs)
+            per_token_loss[valid_mask] = -advantages[valid_mask] * (
+                sampled_weight * log_probs[valid_mask] - correction
+            )
+        else:
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            per_token_loss1 = coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
         # DDP/FSDP averages gradients across ranks (world_size).
         # To get correct per-token normalization we scale by 1/tokens_per_rank
@@ -1508,23 +1570,41 @@ class AsyncGRPOTrainer(_BaseTrainer):
             # Compute the clipped probability ratios
             is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
             is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
+            if self.score_centering:
+                is_low_clipped = torch.zeros_like(is_low_clipped)
+                is_high_clipped = torch.zeros_like(is_high_clipped)
             is_region_clipped = is_low_clipped | is_high_clipped
             local_low_clip_sum = is_low_clipped[valid_mask].float().sum()
             local_high_clip_sum = is_high_clipped[valid_mask].float().sum()
             local_region_clip_sum = is_region_clipped[valid_mask].float().sum()
 
-            # Batch all-reduce: [ratio_sum, kl_sum, entropy_sum, low_clip_sum, high_clip_sum, region_clip_sum, count]
-            stats = torch.stack(
-                [
-                    local_ratio_sum,
-                    local_kl_sum,
-                    local_entropy_sum,
-                    local_low_clip_sum,
-                    local_high_clip_sum,
-                    local_region_clip_sum,
-                    local_count,
-                ]
-            )
+            # Batch all-reduce the token sums before recording per-token means.
+            stat_sums = [
+                local_ratio_sum,
+                local_kl_sum,
+                local_entropy_sum,
+                local_low_clip_sum,
+                local_high_clip_sum,
+                local_region_clip_sum,
+                local_count,
+            ]
+            if self.score_centering:
+                sampler_head_mass = sampler_head_probs.sum(-1)
+                train_head_mass = train_head_probs.sum(-1)
+                head_kl = (sampler_head_probs * (sampler_head_log_probs - train_head_log_probs)).sum(-1)
+                head_kl += (1 - sampler_head_mass).clamp_min(1e-6) * rho.log()
+                stat_sums.extend(
+                    [
+                        correction.sum(),
+                        sampler_head_mass.sum(),
+                        train_head_mass.sum(),
+                        head_kl.sum(),
+                        (log_probs[valid_mask] - old_log_probs[valid_mask]).abs().sum(),
+                        rho.sum(),
+                        sampled_weight.sum(),
+                    ]
+                )
+            stats = torch.stack(stat_sums)
             stats = self.accelerator.reduce(stats, reduction="sum")
             (
                 global_ratio_sum,
@@ -1534,13 +1614,28 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 global_high_clip_sum,
                 global_region_clip_sum,
                 global_count,
-            ) = stats.unbind(0)
+            ) = stats[:7].unbind(0)
             self._metrics["train"]["ratio"].append((global_ratio_sum / global_count).item())
             self._metrics["train"]["kl"].append((global_kl_sum / global_count).item())
             self._metrics["train"]["entropy"].append((global_entropy_sum / global_count).item())
             self._metrics["train"]["clip_ratio/low_mean"].append((global_low_clip_sum / global_count).item())
             self._metrics["train"]["clip_ratio/high_mean"].append((global_high_clip_sum / global_count).item())
             self._metrics["train"]["clip_ratio/region_mean"].append((global_region_clip_sum / global_count).item())
+            if self.score_centering:
+                for key, value in zip(
+                    (
+                        "score_centering/correction",
+                        "score_centering/sampler_head_mass",
+                        "score_centering/train_head_mass",
+                        "score_centering/head_kl",
+                        "score_centering/logp_absdiff",
+                        "score_centering/rho",
+                        "score_centering/importance_weight",
+                    ),
+                    stats[7:],
+                    strict=True,
+                ):
+                    self._metrics["train"][key].append((value / global_count).item())
 
             seq_ids = (position_ids[0] == 0).cumsum(0)[1:] - 1  # (T-1,) completion index per (shifted) token
             n_completions = (position_ids == 0).sum()  # number of packed completions in this rank's row

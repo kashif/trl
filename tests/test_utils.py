@@ -1481,14 +1481,21 @@ class TestPatchFusedLMHead:
         ref_logprobs = ref_log_p.gather(-1, shifted_labels.unsqueeze(-1)).squeeze(-1)
         ref_p = ref_logits.softmax(dim=-1)
         ref_entropy = -(ref_p * ref_log_p).sum(dim=-1)
+        head_ids = torch.randint(0, model.config.vocab_size, (B * (S - 1), 4), device=torch_device)
 
         # Chunked forward
         patch_fused_lm_head(model, temperature)
         with torch.no_grad():
-            out = model(input_ids=input_ids, labels=labels, fused_lm_head=True)
+            out = model(input_ids=input_ids, labels=labels, fused_lm_head=True, score_centering_ids=head_ids)
 
         torch.testing.assert_close(out["log_probs"], ref_logprobs, atol=5e-3, rtol=5e-3)
         torch.testing.assert_close(out["entropy"], ref_entropy, atol=5e-3, rtol=5e-3)
+        torch.testing.assert_close(
+            out.score_centering_log_probs,
+            ref_log_p.reshape(-1, model.config.vocab_size).gather(-1, head_ids),
+            atol=5e-3,
+            rtol=5e-3,
+        )
 
     @pytest.mark.parametrize("model_id", _FUSED_LM_HEAD_MODEL_IDS)
     @pytest.mark.parametrize("temperature", [1.0, 0.7])

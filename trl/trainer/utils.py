@@ -1463,8 +1463,8 @@ _CHUNKED_LOGPROB_CHUNK_SIZE = 32768
 @dataclass
 class FusedCausalLMOutput(ModelOutput):
     """
-    Output of a model patched with [`patch_fused_lm_head`] and called with `fused_lm_head=True`. Every per-token field
-    is zero where the label is `-100`.
+    Output of a model patched with [`patch_fused_lm_head`] and called with `fused_lm_head=True`. Label-aligned fields
+    are zero where the label is `-100`.
 
     Args:
         loss (`torch.Tensor`):
@@ -1481,6 +1481,8 @@ class FusedCausalLMOutput(ModelOutput):
             sequence than the caller's labels.
         aux_loss (`torch.Tensor`, *optional*):
             MoE load-balancing loss, when called with `output_router_logits=True`.
+        score_centering_log_probs (`torch.Tensor`, *optional*):
+            Log-probabilities at the supplied score-centering token IDs, packed over non-ignored labels.
     """
 
     loss: torch.Tensor | None = None
@@ -1488,6 +1490,7 @@ class FusedCausalLMOutput(ModelOutput):
     entropy: torch.Tensor | None = None
     label_mask: torch.Tensor | None = None
     aux_loss: torch.Tensor | None = None
+    score_centering_log_probs: torch.Tensor | None = None
 
 
 def patch_fused_lm_head(model: PreTrainedModel, temperature: float = 1.0, cast_lm_head_to_fp32: bool = False) -> None:
@@ -1526,7 +1529,14 @@ def patch_fused_lm_head(model: PreTrainedModel, temperature: float = 1.0, cast_l
     # Keep the original signature: `generate` validates its model kwargs against it
     @functools.wraps(type(model).forward)
     def _fused_forward(
-        self, *args, fused_lm_head=False, labels=None, shift_labels=None, num_items_in_batch=None, **kwargs
+        self,
+        *args,
+        fused_lm_head=False,
+        labels=None,
+        shift_labels=None,
+        num_items_in_batch=None,
+        score_centering_ids=None,
+        **kwargs,
     ):
         if not fused_lm_head:
             if labels is not None:
@@ -1550,6 +1560,8 @@ def patch_fused_lm_head(model: PreTrainedModel, temperature: float = 1.0, cast_l
             hidden_states = outputs.last_hidden_state
             labels = shift_labels
         mask = labels != -100
+        if score_centering_ids is not None and score_centering_ids.shape[0] != mask.sum():
+            raise ValueError("`score_centering_ids` must have one row per completion token.")
         autocast_ctx = nullcontext()
         if cast_lm_head_to_fp32:
             hidden_states = hidden_states.float()
@@ -1573,10 +1585,12 @@ def patch_fused_lm_head(model: PreTrainedModel, temperature: float = 1.0, cast_l
                 _CHUNKED_LOGPROB_CHUNK_SIZE,
                 final_logit_softcapping,
                 logit_scale,
+                score_centering_ids,
             )
         # `masked_scatter` keeps the output connected to the model even when no label is valid. This lets an
         # all-masked microbatch contribute a differentiable zero instead of failing in `backward()`.
-        log_probs, entropy = (x.new_zeros(mask.shape).masked_scatter(mask, x) for x in per_token)
+        log_probs, entropy = (x.new_zeros(mask.shape).masked_scatter(mask, x) for x in per_token[:2])
+        score_centering_log_probs = per_token[2] if score_centering_ids is not None else None
         loss = -log_probs.sum() / (mask.sum().clamp(min=1) if num_items_in_batch is None else num_items_in_batch)
 
         aux_loss = None
@@ -1602,7 +1616,14 @@ def patch_fused_lm_head(model: PreTrainedModel, temperature: float = 1.0, cast_l
             )
             loss = loss + getattr(text_config, "router_aux_loss_coef", 0.0) * aux_loss
 
-        return FusedCausalLMOutput(loss=loss, log_probs=log_probs, entropy=entropy, label_mask=mask, aux_loss=aux_loss)
+        return FusedCausalLMOutput(
+            loss=loss,
+            log_probs=log_probs,
+            entropy=entropy,
+            label_mask=mask,
+            aux_loss=aux_loss,
+            score_centering_log_probs=score_centering_log_probs,
+        )
 
     model.forward = types.MethodType(_fused_forward, model)
 

@@ -682,6 +682,29 @@ training_args = GRPOConfig(
 )
 ```
 
+### Score Centering Stabilizes Off-policy Reinforcement Learning
+
+**📜 Paper**: https://huggingface.co/papers/2609.20807
+
+Score centering removes the drift caused by a difference between the rollout sampler and the training model. The
+[`AsyncGRPOTrainer`](async_grpo_trainer) records the sampler's top-token probabilities and uses them to center the
+REINFORCE score at each generated token. The remaining probability mass is modeled with the trainer's distribution,
+as in the paper's top-k approximation.
+For stale rollouts, the trainer can compose this correction with token-level truncated importance sampling.
+
+```python
+from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
+
+training_args = AsyncGRPOConfig(
+    output_dir="score-centering",
+    score_centering=True,
+    score_centering_top_k=128,  # "we only store a top-k approximation ... where k=128"
+)
+# The paper's other training hyperparameters are experiment-specific.
+# Start the vLLM server with --max-logprobs 128 or higher.
+trainer = AsyncGRPOTrainer(model="Qwen/Qwen3-0.6B", args=training_args, train_dataset=dataset, reward_funcs=reward_fn)
+```
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].

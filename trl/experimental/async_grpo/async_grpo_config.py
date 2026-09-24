@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -71,6 +72,13 @@ class AsyncGRPOConfig(_BaseConfig):
             Float that penalizes new tokens based on whether they appear in the prompt and the generated text so far.
             Values > 1.0 encourage the model to use new tokens, while values < 1.0 encourage the model to repeat
             tokens.
+        score_centering (`bool`, *optional*, defaults to `False`):
+            Use the score-centering REINFORCE loss to correct training-inference mismatch. Requires untruncated sampling
+            without a repetition penalty. The vLLM server must allow at least `score_centering_top_k` logprobs.
+        score_centering_top_k (`int`, *optional*, defaults to `128`):
+            Number of sampler top-token log probabilities used to approximate the score-centering correction.
+        score_centering_importance_sampling_clip_max (`float`, *optional*):
+            If set, compose score centering with token-level truncated importance sampling using this upper bound.
         chat_template_kwargs (`dict[str, Any]`, *optional*):
             Additional keyword arguments to pass to the `apply_chat_template` function when generating completions.
         max_tool_calling_iterations (`int`, *optional*):
@@ -270,6 +278,18 @@ class AsyncGRPOConfig(_BaseConfig):
             "to repeat tokens."
         },
     )
+    score_centering: bool = field(
+        default=False,
+        metadata={"help": "Use the score-centering REINFORCE loss to correct training-inference mismatch."},
+    )
+    score_centering_top_k: int = field(
+        default=128,
+        metadata={"help": "Number of sampler top-token log probabilities for score centering."},
+    )
+    score_centering_importance_sampling_clip_max: float | None = field(
+        default=None,
+        metadata={"help": "Token-level truncated importance-sampling bound for score centering."},
+    )
     chat_template_kwargs: dict | str | None = field(
         default=None,
         metadata={
@@ -393,6 +413,23 @@ class AsyncGRPOConfig(_BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.score_centering_importance_sampling_clip_max is not None:
+            if (
+                not self.score_centering
+                or not math.isfinite(self.score_centering_importance_sampling_clip_max)
+                or self.score_centering_importance_sampling_clip_max <= 0
+            ):
+                raise ValueError(
+                    "`score_centering_importance_sampling_clip_max` requires score centering and a positive bound."
+                )
+        if self.score_centering:
+            if self.score_centering_top_k < 1:
+                raise ValueError("`score_centering_top_k` must be positive when `score_centering=True`.")
+            if self.temperature <= 0 or self.top_p != 1.0 or self.top_k != 0 or self.min_p is not None:
+                raise ValueError("Score centering requires temperature > 0, top_p=1, top_k=0, and min_p=None.")
+            if self.repetition_penalty != 1.0:
+                raise ValueError("Score centering requires repetition_penalty=1.0.")
 
         if self.parallelism_config is not None and (
             self.parallelism_config.cp_enabled or self.parallelism_config.sp_enabled

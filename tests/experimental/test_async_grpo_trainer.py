@@ -913,6 +913,21 @@ class TestPackingAwareBatching(TrlTestCase):
         # Per-sample rewards are aggregated here on rank 0 rather than broadcast with the batch and reduced back.
         assert collator.metrics["reward"] == [0.375]  # mean over the whole micro-batch: (0.5 + 0.25) / 2
 
+    def test_collator_packs_score_centering_heads_by_rank(self):
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=2, score_centering_top_k=2)
+        a = _rollout_sample(3, advantage=1.0)
+        b = _rollout_sample(2, advantage=-1.0)
+        a["score_centering_ids"] = [[3, 4], [5, 6]]
+        a["score_centering_log_probs"] = [[-0.1, -3.0], [-0.2, -2.0]]
+        b["score_centering_ids"] = [[7, 8]]
+        b["score_centering_log_probs"] = [[-0.3, -2.0]]
+
+        batch = collator([[[a], [b]]])
+
+        assert batch["score_centering_ids"].tolist() == [[[3, 4], [5, 6]], [[7, 8], [0, 0]]]
+        torch.testing.assert_close(batch["score_centering_log_probs"][0, :, 0], torch.tensor([-0.1, -0.2]))
+        assert batch["global_n_tokens"].tolist() == [3.0, 3.0]
+
     def test_collator_packs_multiple_samples_per_row(self):
         # Two samples per row: position_ids reset at each sequence start and advantages expand per token.
         collator = DataCollatorForRollout(pad_token_id=0, num_processes=2)
@@ -952,6 +967,147 @@ class TestPackingAwareBatching(TrlTestCase):
 def _finalize(turns, rollout_id="r0", fork_threshold=1024):
     rows, _tally = _chain_to_sequences(turns, rollout_id, fork_threshold)
     return rows
+
+
+def test_score_centering_heads_follow_retokenization():
+    first = TurnRecord([1, 2], [10, 11], [-0.1, -0.2], [[3, 4], [5, 6]], [[-0.3, -2.0], [-0.4, -2.0]])
+    second = TurnRecord([1, 2, 10, 12], [20], [-0.5], [[7, 8]], [[-0.2, -3.0]])
+
+    (sequence,) = _finalize([first, second])
+
+    assert sequence.completion_mask == [0, 0, 1, 0, 1]
+    assert sequence.score_centering_ids == [[3, 4], [7, 8]]
+    assert sequence.score_centering_log_probs == [[-0.3, -2.0], [-0.2, -3.0]]
+
+
+def test_score_centering_reads_vllm_top_logprobs():
+    loop = object.__new__(_AsyncRolloutLoop)
+    loop.model_name = "model"
+    loop.lora_name = None
+    loop.max_tokens = 8
+    loop.temperature = 1.0
+    loop.top_p = 1.0
+    loop.top_k = 0
+    loop.min_p = None
+    loop.repetition_penalty = 1.0
+    loop.request_timeout = 10
+    loop.score_centering_top_k = 2
+    payloads = []
+
+    async def post(path, payload, timeout):
+        payloads.append(payload)
+        return {
+            "choices": [
+                {
+                    "token_ids": [9],
+                    "logprobs": {
+                        "token_logprobs": [-3.0],
+                        "top_logprobs": [{"token_id:9": -3.0, "token_id:1": -0.2, "token_id:2": -2.0}],
+                    },
+                }
+            ]
+        }
+
+    async def retry(fn, **kwargs):
+        return await fn()
+
+    loop._post = post
+    loop._retry = retry
+    tokens, sampled, ids, logprobs = asyncio.run(loop._generate_one_turn([1, 2]))
+
+    assert (tokens, sampled, ids, logprobs) == ([9], [-3.0], [[1, 2]], [[-0.2, -2.0]])
+    assert payloads[0]["logprobs"] == 2
+    assert payloads[0]["return_tokens_as_token_ids"]
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        {"score_centering_top_k": 0},
+        {"temperature": 0.0},
+        {"top_p": 0.9},
+        {"top_k": 5},
+        {"min_p": 0.1},
+        {"repetition_penalty": 1.2},
+        {"score_centering_importance_sampling_clip_max": 0.0},
+        {"score_centering_importance_sampling_clip_max": float("inf")},
+    ],
+)
+def test_score_centering_rejects_unsupported_sampling(tmp_path, setting):
+    with pytest.raises(
+        ValueError, match="Score centering|score_centering_top_k|score_centering_importance_sampling_clip_max"
+    ):
+        AsyncGRPOConfig(output_dir=str(tmp_path), score_centering=True, **setting)
+
+
+def test_score_centering_importance_sampling_requires_score_centering(tmp_path):
+    with pytest.raises(ValueError, match="score_centering_importance_sampling_clip_max"):
+        AsyncGRPOConfig(output_dir=str(tmp_path), score_centering_importance_sampling_clip_max=2.0)
+
+
+@pytest.mark.parametrize("clip_max", [None, 2.0])
+def test_score_centering_trainer_loss_matches_dense_reference(clip_max):
+    trainer = object.__new__(AsyncGRPOTrainer)
+    trainer.score_centering = True
+    trainer.score_centering_importance_sampling_clip_max = clip_max
+    trainer.epsilon_low = trainer.epsilon_high = 0.2
+    trainer.aux_loss_enabled = False
+    trainer.current_gradient_accumulation_steps = 1
+    trainer.accelerator = SimpleNamespace(num_processes=1, reduce=lambda x, reduction: x, gather=lambda x: x)
+    trainer._metrics = {"train": defaultdict(list)}
+    trainer._step_forward_tokens = 0
+    trainer._step_trained_tokens = 0
+    trainer._step_seq_len_weighted = 0
+    trainer._step_samples = 0
+    trainer._step_forward_s = 0
+
+    logits = torch.tensor([[0.5, -0.2, 1.0, 0.1], [-0.3, 0.8, 0.2, -0.4]], requires_grad=True)
+    head_ids = torch.tensor([[2, 0], [1, 2]])
+    sampler = torch.tensor([[0.15, 0.2, 0.55, 0.1], [0.1, 0.45, 0.35, 0.1]])
+    inputs = {
+        "input_ids": torch.tensor([0, 2, 1]),
+        "attention_mask": torch.ones(3),
+        "completion_mask": torch.tensor([0, 1, 1]),
+        "old_log_probs": torch.tensor([0.0, sampler[0, 2].log(), sampler[1, 1].log()]),
+        "position_ids": torch.arange(3),
+        "advantages": torch.tensor([0.0, 1.2, -0.7]),
+        "score_centering_ids": head_ids,
+        "score_centering_log_probs": sampler.gather(-1, head_ids).log(),
+        "global_n_tokens": torch.tensor([2.0]),
+        "global_n_forward_tokens": torch.tensor([3.0]),
+        "mean_seq_len": torch.tensor([3.0]),
+    }
+
+    def model(**kwargs):
+        log_probs = logits.log_softmax(-1)
+        return SimpleNamespace(
+            log_probs=log_probs.gather(-1, inputs["input_ids"][1:, None]).squeeze(-1)[None],
+            entropy=torch.zeros(1, 2),
+            score_centering_log_probs=log_probs.gather(-1, kwargs["score_centering_ids"]),
+        )
+
+    loss = trainer.compute_loss(model, inputs)
+    loss.backward()
+
+    ref_logits = logits.detach().clone().requires_grad_()
+    ref_log_probs = ref_logits.log_softmax(-1)
+    selected = ref_log_probs[torch.arange(2), inputs["input_ids"][1:]]
+    head = ref_log_probs.gather(-1, head_ids)
+    with torch.no_grad():
+        p = head.exp()
+        q = sampler.gather(-1, head_ids)
+        rho = (1 - q.sum(-1)) / (1 - p.sum(-1))
+        if clip_max is None:
+            weight = torch.ones_like(selected)
+            coefficients = q - rho[:, None] * p
+        else:
+            weight = (selected - inputs["old_log_probs"][1:]).exp().clamp(max=clip_max)
+            coefficients = torch.minimum(p, clip_max * q) - (clip_max * rho).clamp(max=1)[:, None] * p
+    ref_loss = (-inputs["advantages"][1:] * (weight * selected - (coefficients * head).sum(-1))).mean()
+    ref_loss.backward()
+
+    torch.testing.assert_close(loss, ref_loss)
+    torch.testing.assert_close(logits.grad, ref_logits.grad)
 
 
 class TestRolloutWorkerProtocol(TrlTestCase):
