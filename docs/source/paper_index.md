@@ -732,11 +732,13 @@ from trl.experimental.async_grpo import AsyncGRPOConfig
 training_args = AsyncGRPOConfig(
     ...,
     score_centering=True,  # default; `False` trains with the clipped objective instead
-    importance_sampling_min=0.5,  # hyper-parameter C_min
-    importance_sampling_max=5.0,  # hyper-parameter C_max
-    num_sampler_logprobs=8,  # tokens per position the expectation is taken over
+    importance_sampling_min=0.5,  # MIS low=0.5 (Table 1)
+    importance_sampling_max=5.0,  # MIS high=5.0 (Table 1)
+    num_sampler_logprobs=128,  # "k=128" in Appendix B.2; TRL defaults to 8
 )
 ```
+
+Start vLLM with `--max-logprobs 128` when using the paper's head width.
 
 ## Optimal Advantage Regression
 

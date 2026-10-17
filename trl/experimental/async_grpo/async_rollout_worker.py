@@ -436,7 +436,7 @@ class _AsyncRolloutLoop:
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
-        self.sampling_replay = top_p < 1.0 or top_k > 0
+        self.sampling_replay = top_p < 1.0 or top_k > 0 or (min_p is not None and min_p > 0)
         self.num_sampler_logprobs = num_sampler_logprobs
         self.min_p = min_p
         self.repetition_penalty = repetition_penalty
@@ -562,12 +562,12 @@ class _AsyncRolloutLoop:
             self._loop.close()
 
     async def _check_sampling_replay(self) -> None:
-        """With top-k/top-p, make sure the server returns the candidate set of every sampled token.
+        """With filtered sampling, make sure the server returns the candidate set of every sampled token.
 
         That takes vLLM >= 0.28 started with `--return-sampling-mask` (recorded in its config) and `--enable-scale-out`
         (the endpoint that returns the set). Checked once up front: without them the first rollout would fail on a
-        route that does not exist, after retrying it for minutes. An older vLLM cannot return the set at all, so it
-        keeps the full-vocabulary normalization, with a warning about the bias.
+        route that does not exist, after retrying it for minutes. An older vLLM cannot return the set at all, so
+        score centering rejects filtered sampling; the clipped objective warns about the biased ratio.
         """
         if not self.sampling_replay:
             return
@@ -575,9 +575,11 @@ class _AsyncRolloutLoop:
             r.raise_for_status()
             version = (await r.json())["version"]
         if Version(version) < Version("0.28.0"):
+            if self.num_sampler_logprobs:
+                raise RuntimeError("Score centering with filtered sampling requires vLLM >= 0.28 for mask replay.")
             logger.warning(
                 f"vLLM {version} cannot return the candidate set a token was sampled from (vLLM >= 0.28), so with "
-                "top_k/top_p the log-probabilities are normalized over the whole vocabulary and the importance ratio "
+                "filtered sampling the log-probabilities are normalized over the whole vocabulary and the importance ratio "
                 "is biased."
             )
             self.sampling_replay = False
@@ -590,7 +592,7 @@ class _AsyncRolloutLoop:
             paths = (await r.json())["paths"]
         if not model_config.get("return_sampling_mask") or "/inference/v1/generate" not in paths:
             raise RuntimeError(
-                "top_k/top_p sampling needs the candidate set of every sampled token, which the trainer renormalizes "
+                "Filtered sampling needs the candidate set of every sampled token, which the trainer renormalizes "
                 "its log-probabilities over. Start the vLLM server (>= 0.28) with "
                 "`--return-sampling-mask --enable-scale-out`."
             )

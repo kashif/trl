@@ -98,6 +98,8 @@ def test_loop_owning_capture_defaults_to_lossless_reconciliation(monkeypatch, ad
         self.top_p = 1.0
         self.top_k = -1
         self.min_p = 0.0
+        self.sampling_replay = False
+        self.num_sampler_logprobs = 0
         self.repetition_penalty = 1.0
         self.max_tokens = 32
         self.reward_func_names = []
@@ -180,9 +182,15 @@ class Session:
         self.closed.set()
 
 
-def test_loop_owning_capture_rejects_truncated_sampling(make_loop):
+@pytest.mark.parametrize("sampling_kwargs", [{"top_p": 0.95, "top_k": 512}, {"min_p": 0.1, "top_k": 512}])
+def test_loop_owning_capture_rejects_truncated_sampling(make_loop, sampling_kwargs):
     with pytest.raises(ValueError, match="candidate set"):
-        make_loop(top_p=0.95, top_k=512)
+        make_loop(**sampling_kwargs)
+
+
+def test_loop_owning_capture_rejects_score_centering(make_loop):
+    with pytest.raises(ValueError, match="sampler top log-probabilities"):
+        make_loop(num_sampler_logprobs=8)
 
 
 @pytest.mark.parametrize("temperature", [0.3, 0.8, 1.2])

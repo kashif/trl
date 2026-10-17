@@ -442,9 +442,9 @@ class AsyncGRPOConfig(_BaseConfig):
         if self.score_centering and self.num_sampler_logprobs < 1:
             raise ValueError("`score_centering=True` needs `num_sampler_logprobs >= 1`.")
 
-        if self.top_p < 1.0 and self.top_k == 0:
+        if (self.top_p < 1.0 or (self.min_p is not None and self.min_p > 0)) and self.top_k == 0:
             raise ValueError(
-                "`top_p < 1.0` needs `top_k > 0`: vLLM bounds the candidate set it returns for each sampled token "
+                "Filtered sampling needs `top_k > 0`: vLLM bounds the candidate set it returns for each sampled token "
                 "with `top_k` (e.g. `top_k=512`)."
             )
 

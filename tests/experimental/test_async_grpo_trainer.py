@@ -1825,8 +1825,9 @@ class TestGenerateOneTurn(TrlTestCase):
         loop.session = FakeSession()
         asyncio.run(loop._check_sampling_replay())
 
-    def test_truncated_sampling_checks_the_server_up_front(self):
-        loop = _rollout_loop(top_p=0.9, top_k=4)
+    @pytest.mark.parametrize("sampling_kwargs", [{"top_p": 0.9}, {"min_p": 0.1}])
+    def test_truncated_sampling_checks_the_server_up_front(self, sampling_kwargs):
+        loop = _rollout_loop(top_k=4, **sampling_kwargs)
         self._check(loop, {"return_sampling_mask": True}, {"/inference/v1/generate": {}})
         with pytest.raises(RuntimeError, match="--return-sampling-mask"):
             self._check(loop, {"return_sampling_mask": False}, {"/inference/v1/generate": {}})
@@ -1850,10 +1851,14 @@ class TestGenerateOneTurn(TrlTestCase):
         assert requests[0][0] == "/v1/completions"
         assert requests[0][1]["top_p"] == 0.9
         assert sampling_mask is None
+        loop = _rollout_loop(top_p=0.9, top_k=4, num_sampler_logprobs=2)
+        with pytest.raises(RuntimeError, match="Score centering with filtered sampling requires vLLM >= 0.28"):
+            self._check(loop, {}, {"/v1/completions": {}}, version="0.27.1")
 
-    def test_top_p_requires_top_k(self):
+    @pytest.mark.parametrize("sampling_kwargs", [{"top_p": 0.9}, {"min_p": 0.1}])
+    def test_filtered_sampling_requires_top_k(self, sampling_kwargs):
         with pytest.raises(ValueError, match="top_k"):
-            AsyncGRPOConfig(top_p=0.9)
+            AsyncGRPOConfig(**sampling_kwargs)
 
 
 @require_response_parsing
