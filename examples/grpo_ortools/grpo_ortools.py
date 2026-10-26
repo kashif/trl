@@ -127,7 +127,10 @@ def main():
             if result.observation.error is not None:
                 # Rejected before scoring (e.g. a solution passed as a string), so the episode goes on.
                 raise ValueError(result.observation.error.message)
-            self.reward = result.reward
+            # The episode ends at the first accepted submission; anything else (e.g. the wrong submit tool for the
+            # level) leaves it open with no reward yet.
+            if result.done:
+                self.reward = result.reward
             return result.observation.result["content"][0]["text"]
 
         def run_python(self, code: str) -> str:
