@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument("--dataset-size", type=int, default=512)
     parser.add_argument("--allow-ortools", action="store_true")
     parser.add_argument("--compute-budget", type=float, default=60.0, help="Sandbox seconds per episode.")
-    parser.add_argument("--max-tool-calls", type=int, default=4)
+    parser.add_argument("--max-tool-calls", type=int, default=4, help="Python and check calls per episode.")
     parser.add_argument("--num-generations", type=int, default=8)
     parser.add_argument("--per-device-train-batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -144,6 +144,30 @@ def main():
                 The script output and the remaining compute budget.
             """
             return self.client.call_tool("run_python", code=code)
+
+        def check_solution(self, solution: dict) -> str:
+            """
+            Check a candidate solution for the instance (level 1) without submitting it. Counts as a Python call.
+
+            Args:
+                solution: The solution as a JSON object (not a string), in the format given in the problem statement.
+
+            Returns:
+                The objective and the naive objective, or why the solution is infeasible.
+            """
+            return self.client.call_tool("check_solution", solution=solution)
+
+        def test_algorithm(self, code: str) -> str:
+            """
+            Run `solve` on the example instance (level 2) without submitting it. Counts as a Python call.
+
+            Args:
+                code: The Python source defining `solve`.
+
+            Returns:
+                The objective and the naive objective, or why `solve` failed.
+            """
+            return self.client.call_tool("test_algorithm", code=code)
 
         def submit_solution(self, solution: dict) -> str:
             """
