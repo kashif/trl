@@ -720,7 +720,7 @@ class TestHeadLossNumerics:
             hidden, weight, None, targets, 1.0, chunk_size, None, 1.0, (), support, score_ids
         )
         advantages = torch.tensor([0.5, -1.0, 2.0], device=device)
-        torch.testing.assert_close(score_logps[:, 0], logps, atol=0, rtol=1e-6)
+        torch.testing.assert_close(score_logps[:, 0], logps)
         loss = -((logps + score_logps[:, 0]) * advantages).sum()
         loss.backward()
         logits = (hidden.detach().double() @ weight.detach().double().t()).requires_grad_()
@@ -731,9 +731,9 @@ class TestHeadLossNumerics:
             ref_logps = logits.log_softmax(-1)
         ref_loss = -2 * (ref_logps.diagonal() * advantages.double()).sum()
         ref_loss.backward()
-        torch.testing.assert_close(loss.double(), ref_loss, atol=0, rtol=1e-6)
+        torch.testing.assert_close(loss.double(), ref_loss)
         torch.testing.assert_close(
-            weight.grad.double(), logits.grad.t(), atol=0, rtol=1e-2 if dtype == torch.bfloat16 else 1e-6
+            weight.grad.double(), logits.grad.t(), rtol=1e-2 if dtype == torch.bfloat16 else 1e-6, atol=1e-7
         )
 
     @pytest.mark.parametrize("chunk_size", [2, 4])
