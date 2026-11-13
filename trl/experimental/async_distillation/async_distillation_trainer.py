@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import contextvars
 import copy
 import itertools
@@ -26,6 +27,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -33,6 +35,7 @@ import torch
 import torch.nn.functional as F
 import transformers
 from accelerate import Accelerator
+from accelerate.data_loader import prepare_data_loader
 from accelerate.logging import get_logger
 from accelerate.utils import broadcast_object_list, is_peft_model, set_seed
 from datasets import Dataset, IterableDataset
@@ -670,6 +673,8 @@ class DataCollatorForRollout(DataCollatorMixin):
             Token id used to pad `input_ids`.
         num_processes (`int`, *optional*, defaults to `1`):
             Number of DP ranks; the micro-batch is packed into this many rows.
+        model_parallel_size (`int`, *optional*, defaults to `1`):
+            Number of tensor/context-parallel ranks that share each data-parallel row.
         teacher_id_to_idx (`dict[str, int]`, *optional*):
             Maps each configured `teacher_server_urls` key to a stable integer index, packed per-position (like every
             other per-token field) as `teacher_id_idx` so `compute_loss` can break `jsd`/`entropy`/ `teacher_entropy`
@@ -692,6 +697,7 @@ class DataCollatorForRollout(DataCollatorMixin):
     # The trainer's metric sink, shared by reference (like `prompts_trained`).
     metrics: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     token_budget: int = 0
+    model_parallel_size: int = 1
 
     def torch_call(self, examples: list[Any]) -> dict[str, Any]:
         # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into `num_processes`
@@ -767,6 +773,8 @@ class DataCollatorForRollout(DataCollatorMixin):
         }
         if teacher_id_idx is not None:
             batch["teacher_id_idx"] = teacher_id_idx
+        if self.model_parallel_size > 1:
+            batch = {key: value.repeat_interleave(self.model_parallel_size, dim=0) for key, value in batch.items()}
         return batch
 
     def _log_metrics(
@@ -1157,15 +1165,17 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # PEFT initializes the adapter weights randomly, so set_seed must be done before creating the model to ensure
         # reproducibility.
         set_seed(args.seed)
-        # FlashAttention is required: training runs in padding-free mode, where sequences are concatenated into a
-        # single row and attention is derived from `position_ids` resets. SDPA/eager can't handle this. Unlike
+        # Packed rows require FlashAttention, which derives sequence boundaries from `position_ids` resets.
+        # Context parallelism instead uses SDPA with separate padded sequences. Unlike
         # AsyncGRPOTrainer, the student's own lm_head is NOT given a fused head (via `add_fused_lm_head`), a chunked
         # realized-token-only head at load time: the divergence loss needs the student's log-probs at several
         # candidate token ids per position (the teacher's top-k + tail), not just the realized token's logprob, which
         # is all that head supports. `compute_loss` chunks the lm_head projection itself instead (`_jsd_loss_chunk`),
         # a different mechanism that does support multiple candidate ids per position.
         # FlashAttention-3 has no kernels for Blackwell GPUs (compute capability 10 and above), FlashAttention-4 does
-        if torch.version.hip:
+        if args.parallelism_config is not None and args.parallelism_config.cp_enabled:
+            attn_implementation = "sdpa"
+        elif torch.version.hip:
             attn_implementation = "kernels-community/aiter-flash-attn@v2"
         elif torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
             attn_implementation = "kernels-community/flash-attn4"
@@ -1280,6 +1290,13 @@ class AsyncDistillationTrainer(_BaseTrainer):
             optimizers=optimizers,
         )
 
+        parallelism = self.accelerator.parallelism_config
+        self._tp_size = parallelism.tp_size if parallelism is not None else 1
+        self._cp_size = parallelism.cp_size if parallelism is not None else 1
+        self._dp_size = self.accelerator.num_processes // (self._tp_size * self._cp_size)
+        if self._cp_size > 1:
+            model.set_attn_implementation("sdpa")
+
         precision = self.accelerator.mixed_precision
         self.compute_dtype = {
             "bf16": "bfloat16",
@@ -1299,9 +1316,7 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # dataloader is driven by the async rollout queue (an IterableDataset with no __len__), so max_steps must be
         # set explicitly for transformers.Trainer's step-counting to work.
         samples_per_step = (
-            self.args.per_device_train_batch_size
-            * self.args.gradient_accumulation_steps
-            * self.accelerator.num_processes
+            self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps * self._dp_size
         )
         if self.args.max_steps <= 0 and train_dataset is not None and hasattr(train_dataset, "__len__"):
             self._epoch_stop_prompts = math.ceil(self.args.num_train_epochs * len(train_dataset))
@@ -1456,7 +1471,7 @@ class AsyncDistillationTrainer(_BaseTrainer):
         return lora_sync
 
     def get_train_dataloader(self) -> DataLoader:
-        num_processes = self.accelerator.num_processes
+        num_processes = self._dp_size
         if self.accelerator.is_main_process:
             dataset = RolloutQueueDataset(
                 rollout_queue=self.rollout_queue,
@@ -1488,23 +1503,79 @@ class AsyncDistillationTrainer(_BaseTrainer):
         else:
             dataset = _EmptyIterableDataset()
 
-        return self.accelerator.prepare(
-            DataLoader(
-                dataset,
-                batch_size=1,
-                collate_fn=DataCollatorForRollout(
-                    self.processing_class.pad_token_id,
-                    num_processes,
-                    self._teacher_id_to_idx if len(self._teacher_ids) > 1 else None,
-                    prompts_trained=self._trained_prompts,
-                    metrics=self._metrics["train"],
-                    # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
-                    # construct the collator (and never use it) while `token_budget` is still `None`.
-                    token_budget=self.args.token_budget or 0,
-                ),
-                num_workers=0,
-            )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=1,
+            collate_fn=DataCollatorForRollout(
+                self.processing_class.pad_token_id,
+                num_processes,
+                self._teacher_id_to_idx if len(self._teacher_ids) > 1 else None,
+                prompts_trained=self._trained_prompts,
+                metrics=self._metrics["train"],
+                # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
+                # construct the collator (and never use it) while `token_budget` is still `None`.
+                token_budget=self.args.token_budget or 0,
+                model_parallel_size=self._tp_size * self._cp_size,
+            ),
+            num_workers=0,
         )
+        if self._tp_size * self._cp_size > 1:
+            # Dispatch one row per rank; the collator repeats each DP row for
+            # its model-parallel ranks. Accelerate's dispatcher currently only
+            # special-cases TP and otherwise splits batches across CP ranks.
+            return prepare_data_loader(
+                dataloader,
+                device=self.accelerator.device,
+                split_batches=True,
+                put_on_device=True,
+                dispatch_batches=True,
+            )
+        return self.accelerator.prepare(dataloader)
+
+    def _prepare_context_parallel_inputs(self, model, inputs):
+        if self._cp_size == 1:
+            return contextlib.nullcontext, inputs
+
+        # SDPA context parallelism supports causal attention, but not the
+        # block-diagonal mask of a packed row. Keep each sequence in its own
+        # batch element, and shift targets BEFORE splitting predictor positions
+        # so a CP boundary never drops a next-token pair.
+        valid = inputs["attention_mask"].bool()
+        positions = inputs["position_ids"][valid]
+        starts = (positions == 0).nonzero().flatten().tolist()
+        ends = starts[1:] + [len(positions)]
+        lengths = [end - start for start, end in zip(starts, ends, strict=True)]
+        seq_length = math.ceil(max(lengths) / (2 * self._cp_size)) * (2 * self._cp_size)
+        prepared = {key: value for key, value in inputs.items() if key.startswith("global_") or key == "mean_seq_len"}
+        for key, padding_value in (
+            ("input_ids", self.processing_class.pad_token_id),
+            ("completion_mask", 0),
+            ("teacher_topk_ids", -1),
+            ("teacher_topk_logprobs", -torch.inf),
+            ("teacher_id_idx", -1),
+        ):
+            if key not in inputs:
+                continue
+            values = inputs[key][valid]
+            rows = [values[start:end] for start, end in zip(starts, ends, strict=True)]
+            shape = (len(rows), seq_length, *values.shape[1:])
+            prepared[key] = values.new_full(shape, padding_value)
+            for i, row in enumerate(rows):
+                prepared[key][i, : len(row)] = row
+            if key != "input_ids":
+                prepared[key] = torch.roll(prepared[key], -1, dims=1)
+                prepared[key][:, -1] = padding_value
+        prepared["actual_token_ids"] = torch.roll(prepared["input_ids"], -1, dims=1)
+        prepared["position_ids"] = (
+            torch.arange(seq_length, device=positions.device).expand(len(lengths), -1).contiguous()
+        )
+        buffers = [value for key, value in prepared.items() if not key.startswith("global_") and key != "mean_seq_len"]
+        return partial(
+            self.accelerator.maybe_context_parallel,
+            buffers=buffers,
+            buffer_seq_dims=[1] * len(buffers),
+            no_restore_buffers=set(buffers),
+        ), prepared
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Route the whole loss (backbone + `lm_head` projection + JSD) through the DDP/FSDP wrapper via
@@ -1519,25 +1590,25 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # Padding-free: the collator already packed this rank's samples into a single row (real tokens concatenated,
         # `position_ids` resetting per sequence), then padded the row to the longest rank's length so
         # DataLoaderDispatcher could scatter rectangular rows. Strip that trailing inter-rank padding here.
-        mask_bool = inputs["attention_mask"].bool()
-        input_ids = inputs["input_ids"][mask_bool].unsqueeze(0)
-        completion_mask = inputs["completion_mask"][mask_bool].unsqueeze(0)
-        position_ids = inputs["position_ids"][mask_bool].unsqueeze(0)
-        teacher_topk_ids = inputs["teacher_topk_ids"][mask_bool].unsqueeze(0)
-        teacher_topk_logprobs = inputs["teacher_topk_logprobs"][mask_bool].unsqueeze(0)
-        # MOPD (multi-teacher on-policy distillation): present only when multiple teachers are configured (see
-        # AsyncDistillationConfig.teacher_server_urls), used below to break jsd/entropy/teacher_entropy down per
-        # teacher; absent (None) with a single teacher, where every sample shares one teacher anyway.
-        teacher_id_idx = inputs["teacher_id_idx"][mask_bool].unsqueeze(0) if "teacher_id_idx" in inputs else None
-
-        # Next-token shift: position j predicts input_ids[:, j+1], so it is compared against the teacher candidates
-        # recorded AT position j+1; teacher_topk_ids[i] holds the candidates for predicting input_ids[i] (it comes
-        # from the teacher's `prompt_logprobs`, whose entry i conditions on the tokens before i).
-        completion_mask = completion_mask[:, 1:]
-        teacher_topk_ids = teacher_topk_ids[:, 1:, :]
-        teacher_topk_logprobs = teacher_topk_logprobs[:, 1:, :]
-        if teacher_id_idx is not None:
-            teacher_id_idx = teacher_id_idx[:, 1:]
+        if self._cp_size > 1:
+            input_ids = inputs["input_ids"]
+            position_ids = inputs["position_ids"]
+            completion_mask = inputs["completion_mask"].flatten().unsqueeze(0)
+            teacher_topk_ids = inputs["teacher_topk_ids"].flatten(0, 1).unsqueeze(0)
+            teacher_topk_logprobs = inputs["teacher_topk_logprobs"].flatten(0, 1).unsqueeze(0)
+            actual_token_ids = inputs["actual_token_ids"].flatten().unsqueeze(0)
+            teacher_id_idx = inputs["teacher_id_idx"].flatten().unsqueeze(0) if "teacher_id_idx" in inputs else None
+        else:
+            mask_bool = inputs["attention_mask"].bool()
+            input_ids = inputs["input_ids"][mask_bool].unsqueeze(0)
+            completion_mask = inputs["completion_mask"][mask_bool].unsqueeze(0)[:, 1:]
+            position_ids = inputs["position_ids"][mask_bool].unsqueeze(0)
+            teacher_topk_ids = inputs["teacher_topk_ids"][mask_bool].unsqueeze(0)[:, 1:, :]
+            teacher_topk_logprobs = inputs["teacher_topk_logprobs"][mask_bool].unsqueeze(0)[:, 1:, :]
+            actual_token_ids = input_ids[:, 1:]
+            teacher_id_idx = (
+                inputs["teacher_id_idx"][mask_bool].unsqueeze(0)[:, 1:] if "teacher_id_idx" in inputs else None
+            )
 
         # Which candidate ids the student needs a log-prob at, and the teacher's log-prob at those same ids — pure
         # teacher-side/input_ids bookkeeping, no student logits needed yet, so this happens before the forward pass.
@@ -1551,7 +1622,6 @@ class AsyncDistillationTrainer(_BaseTrainer):
             # beta != 0.0: narrow the support to just the candidates a mixture/reverse-KL divergence needs,
             # mirroring `ServerDistillationTrainer`'s beta>0 path (including its beta==1.0 special case). A wider
             # support would only probabilistically (not guaranteed) cover what the student itself considers likely.
-            actual_token_ids = input_ids[:, 1:]
             target_ids, teacher_target_logps, valid_candidate_mask = _narrow_top1_actual_support(
                 teacher_topk_ids, teacher_topk_logprobs, actual_token_ids, valid_candidate_mask_wide, self.args.beta
             )
@@ -1561,10 +1631,9 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # position would degenerate through `_add_tail_bucket` into a fabricated "100% tail mass" distribution on
         # both sides, i.e. a synthetic near-zero divergence trained on, instead of being excluded like padding.
         has_teacher_signal = valid_candidate_mask.any(dim=-1)
-        # DDP/FSDP averages gradients across ranks (world_size). To get correct per-token normalization we scale by
-        # 1/tokens_per_rank = world_size / global_n_tokens, so after DDP averaging the effective scale is 1/global_n_tokens.
-        # Mirrors AsyncGRPOTrainer.compute_loss's scaling: this is infra-level (padding-free packing, DDP averaging,
-        # gradient accumulation), not policy-gradient-specific, so it needs no adaptation here. `global_n_tokens` is
+        # DDP/FSDP averages gradients across DP/CP ranks. Scale by their number so the effective normalization after
+        # averaging is 1/global_n_tokens. TP ranks process identical positions and must not multiply this scale.
+        # `global_n_tokens` is
         # computed by the collator from `completion_mask` alone, so it does not shrink when `has_teacher_signal`
         # excludes a position above; a run with such gaps is very slightly under-scaled rather than exactly
         # renormalized, which is an acceptable trade-off for what should be a rare, teacher-side data gap.
@@ -1593,7 +1662,12 @@ class AsyncDistillationTrainer(_BaseTrainer):
             )
         hidden_states = backbone_outputs.last_hidden_state
         self._last_forward_time_s = time.time() - forward_start
-        hidden_states = hidden_states[:, :-1, :][0]  # (seq_len - 1, H), drop the unused last-position prediction
+        if isinstance(hidden_states, DTensor):
+            hidden_states = hidden_states.full_tensor()
+        if self._cp_size > 1:
+            hidden_states = hidden_states.flatten(0, 1)
+        else:
+            hidden_states = hidden_states[:, :-1, :][0]  # drop the unused last-position prediction
 
         lm_head = unwrapped_model.get_output_embeddings()
         lm_head_weight = lm_head.weight
@@ -1638,10 +1712,11 @@ class AsyncDistillationTrainer(_BaseTrainer):
             loss = (hidden_states.sum() + lm_head_weight.sum()) * 0.0
             if lm_head_bias is not None:
                 loss = loss + lm_head_bias.sum() * 0.0
-            local_jsd_sum = hidden_valid.new_zeros(())
-            local_entropy_sum = hidden_valid.new_zeros(())
-            local_teacher_entropy_sum = hidden_valid.new_zeros(())
-            local_per_teacher_stats = hidden_valid.new_zeros(3 * num_teachers)
+            # Match the FP32 loss statistics on ranks that have teacher targets.
+            local_jsd_sum = hidden_valid.new_zeros((), dtype=torch.float32)
+            local_entropy_sum = hidden_valid.new_zeros((), dtype=torch.float32)
+            local_teacher_entropy_sum = hidden_valid.new_zeros((), dtype=torch.float32)
+            local_per_teacher_stats = hidden_valid.new_zeros(3 * num_teachers, dtype=torch.float32)
         else:
             loss, local_jsd_sum, local_entropy_sum, local_teacher_entropy_sum, local_per_teacher_stats = (
                 _chunked_jsd_loss(
@@ -1664,7 +1739,7 @@ class AsyncDistillationTrainer(_BaseTrainer):
 
         global_n_tokens = inputs["global_n_tokens"][0]
         world_size = self.accelerator.num_processes
-        tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
+        tokens_per_rank = global_n_tokens.clamp(min=1.0) / (world_size // self._tp_size)
         loss = loss / tokens_per_rank.to(torch.float32)
         loss = loss / self.current_gradient_accumulation_steps
 

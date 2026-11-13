@@ -19,8 +19,10 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import threading
 import time
 from collections import OrderedDict, defaultdict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -28,11 +30,15 @@ import numpy as np
 import pytest
 import requests
 import torch
-from accelerate import PartialState
+import transformers
+from accelerate import ParallelismConfig, PartialState
+from accelerate.utils import broadcast_object_list
 from datasets import Dataset, load_dataset
+from packaging.version import Version
 from requests.adapters import BaseAdapter
 from safetensors import safe_open
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerControl
+from torch.distributed.tensor import DTensor
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback, TrainerControl
 from transformers.testing_utils import torch_device
 
 from trl.experimental.async_distillation import AsyncDistillationConfig, AsyncDistillationTrainer
@@ -63,6 +69,10 @@ from trl.experimental.server_distillation.server_distillation_trainer import (
 from trl.trainer.base_trainer import _BaseTrainer
 
 from ..testing_utils import TrlTestCase, is_ampere_or_newer, is_bf16_supported, require_peft, require_vllm
+
+
+if Version(transformers.__version__) >= Version("5.18.0"):
+    from transformers.distributed import DistributedConfig
 
 
 TEACHER_TOP_K = 4
@@ -1694,3 +1704,148 @@ class TestStopWatcher:
         stop_event.set()
         watcher.join(timeout=5)
         assert not watcher.is_alive()
+
+
+class _ParallelTeacherHandler(BaseHTTPRequestHandler):
+    """External rollout/scoring endpoint backed by a real CPU teacher."""
+
+    def log_message(self, *args):
+        pass
+
+    def _reply(self, value):
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._reply({"data": [{"id": self.server.model_id, "max_model_len": 256}]})
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path != "/v1/completions":
+            self._reply({})
+            return
+        tokenizer = self.server.tokenizer
+        if "prompt_logprobs" not in payload:
+            # The short response trains only EOS, leaving one CP rank without targets.
+            text = (
+                ""
+                if "short" in tokenizer.decode(payload["prompt"])
+                else "The answer is four, with a longer explanation of the calculation."
+            )
+            ids = tokenizer.encode(text, add_special_tokens=False) + [tokenizer.eos_token_id]
+            self._reply({"choices": [{"token_ids": ids}]})
+            return
+        ids = payload["prompt"]
+        with torch.no_grad():
+            logps = self.server.teacher(torch.tensor([ids])).logits[0].float().log_softmax(-1)
+        rows = [None]
+        for position, realized in enumerate(ids[1:]):
+            values, tokens = logps[position].topk(payload["prompt_logprobs"])
+            row = {
+                str(int(token)): {"logprob": float(value), "rank": rank + 1}
+                for rank, (token, value) in enumerate(zip(tokens, values, strict=True))
+            }
+            if str(realized) not in row:
+                row[str(realized)] = {"logprob": float(logps[position, realized]), "rank": len(row) + 1}
+            rows.append(row)
+        self._reply({"choices": [{"prompt_logprobs": rows}]})
+
+
+class _CaptureParallelGradients(TrainerCallback):
+    def on_pre_optimizer_step(self, args, state, control, model, **kwargs):
+        if state.global_step != 0:
+            return
+        gradients = {}
+        for name, parameter in model.named_parameters():
+            if parameter.grad is not None:
+                grad = parameter.grad.full_tensor() if isinstance(parameter.grad, DTensor) else parameter.grad
+                gradients[name] = grad.detach().cpu().clone()
+        if args.process_index == 0:
+            torch.save(gradients, os.path.join(args.output_dir, "gradients.pt"))
+
+
+@pytest.mark.skipif("TRL_TEST_PARALLEL_MODE" not in os.environ, reason="launched by tests/distributed")
+def test_model_parallel_training_body(monkeypatch):
+    # Keep the real worker, queue, collator, backbone and loss. Only the
+    # remote serving and NCCL weight-transfer endpoints are simulated.
+    monkeypatch.setattr(async_distillation_trainer_module, "AsyncRolloutWorker", AsyncRolloutWorker)
+    mode = os.environ["TRL_TEST_PARALLEL_MODE"]
+    output = os.environ["TRL_TEST_PARALLEL_OUTPUT_DIR"]
+    model_id = "trl-internal-testing/small-Qwen2ForCausalLM-2.5"
+    state = PartialState()
+    server = None
+    if state.is_main_process:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _ParallelTeacherHandler)
+        server.model_id = model_id
+        server.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        server.teacher = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=torch.float32, device_map="cpu", attn_implementation="eager"
+        ).eval()
+        # Avoid a zero-loss parity check against an identical teacher.
+        with torch.no_grad():
+            server.teacher.get_output_embeddings().weight.mul_(50)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = broadcast_object_list([server.server_port if server else None])[0]
+    url = f"http://127.0.0.1:{port}"
+    dataset = Dataset.from_list(
+        [
+            {"prompt": [{"role": "user", "content": question}], "teacher_id": teacher}
+            for question, teacher in (
+                ("Give a short answer: two plus two?", "short"),
+                ("Explain how two plus two is calculated with some detail.", "long"),
+            )
+        ]
+    )
+    args = AsyncDistillationConfig(
+        output_dir=output,
+        model_init_kwargs={"distributed_config": DistributedConfig(tp_size=2)} if mode == "tp" else None,
+        parallelism_config=ParallelismConfig(cp_size=2) if mode == "cp" else None,
+        fsdp=mode == "cp",
+        fsdp_config={"fsdp_version": 2} if mode == "cp" else None,
+        teacher_server_urls={"short": url, "long": url},
+        vllm_server_base_url=url,
+        max_steps=2,
+        gradient_accumulation_steps=2,
+        token_budget=64,
+        max_completion_length=32,
+        max_concurrent_rollouts=1,
+        max_staleness=1,
+        teacher_top_k=4,
+        beta=0.5,
+        learning_rate=0.01,
+        lr_scheduler_type="constant",
+        optim="sgd",
+        max_grad_norm=0,
+        gradient_checkpointing=True,
+        disable_tqdm=True,
+        report_to="none",
+        save_strategy="no",
+        vllm_server_timeout=30,
+        rollout_worker_timeout=120,
+    )
+    trainer = AsyncDistillationTrainer(
+        model_id, args=args, train_dataset=dataset, callbacks=[_CaptureParallelGradients()]
+    )
+    initial = {}
+    for name, parameter in trainer.model.named_parameters():
+        value = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+        initial[name] = value.detach().cpu().clone()
+    try:
+        trainer.train()
+        updates = {}
+        for name, parameter in trainer.accelerator.unwrap_model(trainer.model).named_parameters():
+            value = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+            updates[name] = value.detach().cpu() - initial[name]
+        if state.is_main_process:
+            torch.save(updates, os.path.join(output, "updates.pt"))
+            with open(os.path.join(output, "metrics.json"), "w") as stream:
+                json.dump(trainer.state.log_history, stream)
+    finally:
+        trainer.end()
+        if server:
+            server.shutdown()
+            server.server_close()

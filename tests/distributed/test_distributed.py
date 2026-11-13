@@ -97,6 +97,57 @@ class TestDistributed(TrlTestCase):
         master = torch.load(os.path.join(checkpoint, "pytorch_model_fsdp.bin"), map_location="cpu", weights_only=True)
         assert {tensor.dtype for tensor in master.values() if tensor.is_floating_point()} == {torch.float32}
 
+    @pytest.mark.skipif(Version(transformers.__version__) < Version("5.18.0"), reason="requires DistributedConfig")
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "tp",
+            pytest.param(
+                "cp",
+                marks=pytest.mark.skipif(Version(torch.__version__) < Version("2.6.0"), reason="CP needs torch>=2.6"),
+            ),
+        ],
+    )
+    def test_async_distillation_model_parallel(self, mode):
+        for name, processes in (("reference", 1), (mode, 2)):
+            output = os.path.join(self.tmp_dir, name)
+            os.makedirs(output, exist_ok=True)
+            run_command(
+                [
+                    "torchrun",
+                    "--standalone",
+                    "--nproc_per_node",
+                    str(processes),
+                    "-m",
+                    "pytest",
+                    "tests/experimental/test_async_distillation_trainer.py",
+                    "-k",
+                    "test_model_parallel_training_body",
+                    "-x",
+                    "-q",
+                    "-p",
+                    "no:cacheprovider",
+                ],
+                {**os.environ, "TRL_TEST_PARALLEL_MODE": name, "TRL_TEST_PARALLEL_OUTPUT_DIR": output},
+            )
+        for filename in ("gradients.pt", "updates.pt"):
+            reference = torch.load(os.path.join(self.tmp_dir, "reference", filename), weights_only=True)
+            actual = torch.load(os.path.join(self.tmp_dir, mode, filename), weights_only=True)
+            assert actual.keys() == reference.keys()
+            if filename == "gradients.pt":
+                assert max(value.abs().max().item() for value in reference.values()) > 1e-6
+            for name in reference:
+                # FSDP/SDPA and FlashAttention accumulate BF16 gradients differently.
+                # Scale the tolerance per parameter so small gradients are still checked.
+                atol = max(reference[name].abs().max().item() * 0.01, 1e-8) if filename == "gradients.pt" else 2e-8
+                torch.testing.assert_close(
+                    actual[name],
+                    reference[name],
+                    atol=atol,
+                    rtol=1e-2,
+                    msg=name,
+                )
+
     @pytest.mark.skipif(
         Version(transformers.__version__) < Version("5.19.0"), reason="expert parallelism needs transformers>=5.19.0"
     )

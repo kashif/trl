@@ -1,7 +1,7 @@
 # Async Distillation
 
 > [!IMPORTANT]
-> This trainer requires `vllm`, `transformers>=5.2.0` and `kernels` (training loads FlashAttention from the Hub through it). For distributed training, only FSDP2 is supported (DeepSpeed ZeRO is not).
+> This trainer requires `vllm`, `transformers>=5.2.0` and `kernels` (packed training loads FlashAttention from the Hub through it). Sharded training supports FSDP2 and native Transformers tensor parallelism. DeepSpeed ZeRO and Ulysses sequence parallelism are not supported.
 >
 > Currently, `vllm` and `transformers` have conflicting dependency constraints. To work around this, install vLLM first, then force-install transformers, then add `kernels` through TRL's extra, which pins the version transformers accepts:
 >
@@ -10,6 +10,38 @@
 > pip install 'transformers>=5.2.0' --no-deps
 > pip install 'trl[kernels]'
 > ```
+
+## Training parallelism
+
+Training parallelism is independent of the separate vLLM servers' parallelism. Launch the trainer with `torchrun` and reserve separate GPUs for serving.
+
+For context parallelism, use PyTorch CP with FSDP2:
+
+```python
+from accelerate import ParallelismConfig
+from trl.experimental.async_distillation import AsyncDistillationConfig
+
+args = AsyncDistillationConfig(
+    fsdp=True,
+    fsdp_config={"fsdp_version": 2},
+    parallelism_config=ParallelismConfig(cp_size=2),
+)
+```
+
+CP uses SDPA attention and puts each sequence in a separate padded batch element. Teacher targets are shifted before sequence sharding, preserving predictions across CP boundaries. This path can have more padding than the default FlashAttention packing path.
+
+For native tensor parallelism with Transformers 5.18 or later and a model with a TP plan:
+
+```python
+from transformers.distributed import DistributedConfig
+from trl.experimental.async_distillation import AsyncDistillationConfig
+
+args = AsyncDistillationConfig(
+    model_init_kwargs={"distributed_config": DistributedConfig(tp_size=2)},
+)
+```
+
+TP and CP ranks receive the same samples; only data-parallel ranks receive different samples. The chunked loss currently gathers the output-head weights, including under TP, so it does not provide a vocabulary-sharded loss. Student weight synchronization also gathers parameters before sending them to vLLM.
 
 ## Overview
 
